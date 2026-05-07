@@ -1,0 +1,45 @@
+# Experiment Settings
+experiment:
+  test_name: "randomization"
+  comparative_analysis: true
+  analyze_misclassification: false
+  contrastive_interpretation: true
+  analyze_multimode: true
+  debug_level: 0
+  random_sample: False
+  yaml_config_path: "models/models_config.yaml"
+  sample_idx: 0    
+  
+
+
+# Model Configuration
+model:
+  name: "vgg16" # options: "vit_b_16", "resnet18", "resnet34", "resnet50", "resnet101"
+  model_config_path: "models/models_config.yaml"
+
+# Dataset Configuration
+dataset:
+  name: "imagenet" # options: "imagenette", "imagenet"
+  path: "./data/imagenet-1k"
+  random_sample: true
+  sample_idx: 0
+  batch_size: 1
+
+# Benchmarking Parameters
+benchmarking:
+  test_runs: 100
+  patch_size: 3 # area for insertion/deletion tests
+
+# PAF Modes
+# Each entry corresponds to (ScoringMode, Parameters)
+paf_modes:
+  - mode: "ScoringMode.ABS"
+    params: { tau: 1.0 }
+  - mode: "ScoringMode.POWER"
+    params: { tau: 2.0 }
+  - mode: "ScoringMode.NORM"
+    params: { tau: 1.0 }
+  - mode: "ScoringMode.NORM_POWER"
+    params: { tau: 2.0 }
+  #- mode: "ScoringMode.SIGNED_SPLIT"
+  #  params: { tau: 1.0,alpha: 1.0, beta: 1.0 }  

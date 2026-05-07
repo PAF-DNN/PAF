@@ -1,0 +1,273 @@
+# Model Registry Configuration
+# 
+# Define all available models here - NO code changes needed!
+# Just add new models to this file and use them in training_config.yaml
+#
+# To add a new model:
+# 1. Add a new section below with the model name
+# 2. Specify class_name, module, and modifications
+# 3. Use it in training_config.yaml by setting: model: model_name
+#
+# That's it! No Python code changes needed!
+
+models:
+  # ─────────────────────────────────────────────────────────────────────
+  # ResNet variants (from torchvision)
+  # ─────────────────────────────────────────────────────────────────────
+  
+  resnet18:
+    class_name: resnet18
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "ResNet-18: 18-layer residual network"
+    modifications:
+      fc:
+        type: linear
+        in_features_from: "fc.in_features"
+    # Preprocessing config (used if pretrained=true)
+    preprocessing:
+      imagenet:  # Dataset name
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+      cifar10:
+        resize: 32
+        normalize:
+          mean: [0.4914, 0.4822, 0.4465]
+          std: [0.2023, 0.1994, 0.2010]
+
+  resnet34:
+    class_name: resnet34
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "ResNet-34: 34-layer residual network"
+    modifications:
+      fc:
+        type: linear
+        in_features_from: "fc.in_features"
+    preprocessing:
+      imagenet:
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  resnet50:
+    class_name: resnet50
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "ResNet-50: 50-layer residual network with bottleneck"
+    modifications:
+      fc:
+        type: linear
+        in_features_from: "fc.in_features"
+    preprocessing:
+      imagenet:
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  resnet101:
+    class_name: resnet101
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "ResNet-101: 101-layer residual network"
+    modifications:
+      fc:
+        type: linear
+        in_features_from: "fc.in_features"
+    preprocessing:
+      imagenet:
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  resnet152:
+    class_name: resnet152
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "ResNet-152: 152-layer residual network"
+    modifications:
+      fc:
+        type: linear
+        in_features_from: "fc.in_features"
+    preprocessing:
+      imagenet:
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # VGG variants
+  # ─────────────────────────────────────────────────────────────────────
+  
+  vgg11:
+    class_name: vgg11
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "VGG-11: 11 convolutional layers"
+    modifications:
+      classifier:
+        type: linear
+        in_features_from: "classifier.6.in_features"
+    preprocessing:
+      imagenet:
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  vgg13:
+    class_name: vgg13
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "VGG-13: 13 convolutional layers"
+    modifications:
+      classifier:
+        type: linear
+        in_features_from: "classifier.6.in_features"
+    preprocessing:
+      imagenet:
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+    description: "VGG-13: 13 convolutional layers"
+    modifications:
+      classifier:
+        type: linear
+        in_features_from: "classifier.6.in_features"
+
+  vgg16:
+    class_name: vgg16
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "VGG-16: 16 convolutional layers"
+    modifications:
+      classifier:
+        type: linear
+        in_features_from: "classifier.6.in_features"
+    preprocessing:
+      imagenet:
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  vgg19:
+    class_name: vgg19
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "VGG-19: 19 convolutional layers"
+    modifications:
+      classifier:
+        type: linear
+        in_features_from: "classifier.6.in_features"
+    preprocessing:
+      imagenet:
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Efficient/Lightweight models
+  # ─────────────────────────────────────────────────────────────────────
+  
+  mobilenet_v2:
+    class_name: mobilenet_v2
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "MobileNetV2: Lightweight mobile-friendly network"
+    modifications:
+      classifier:
+        type: linear
+        in_features_from: "classifier.1.in_features"
+    preprocessing:
+      imagenet:
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  squeezenet1_0:
+    class_name: squeezenet1_0
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "SqueezeNet 1.0: Lightweight CNN"
+    modifications:
+      classifier:
+        type: linear
+        in_features_from: "classifier.1.in_features"
+    preprocessing:
+      imagenet:
+        resize: 256
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Vision Transformer (requires torch >= 0.13)
+  # Uncomment if you have torchvision >= 0.12
+  # ─────────────────────────────────────────────────────────────────────
+  
+  # vit_b_16:
+  #   class_name: vit_b_16
+  #   module: torchvision.models
+  #   pretrained_param: pretrained
+  #   description: "Vision Transformer-B/16"
+  #   modifications:
+  #     heads:
+  #       type: linear
+  #       in_features_from: "heads.head.in_features"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Custom models (TEMPLATE - uncomment and modify for your own models)
+  # ─────────────────────────────────────────────────────────────────────
+  
+  # my_custom_model:
+  #   class_name: MyCustomCNN
+  #   module: my_models.custom_architectures
+  #   pretrained_param: pretrained
+  #   description: "My custom CNN architecture"
+  #   modifications:
+  #     fc:
+  #       type: linear
+  #       in_features_from: "fc.in_features"
+
+# ─────────────────────────────────────────────────────────────────────
+# HOW TO ADD A NEW MODEL (Example)
+# ─────────────────────────────────────────────────────────────────────
+#
+# 1. Copy one of the examples above
+# 2. Modify with your model:
+#
+#   my_model:
+#     class_name: MyModel
+#     module: my_package.models
+#     pretrained_param: pretrained
+#     description: "My model description"
+#     modifications:
+#       fc_layer:  # Your layer name
+#         type: linear
+#         in_features_from: "fc_layer.in_features"
+#
+# 3. Use in training_config.yaml:
+#   model: my_model
+#
+# 4. That's it! No Python code changes needed!

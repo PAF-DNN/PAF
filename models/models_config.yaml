@@ -1,0 +1,158 @@
+# =============================================================================
+# MODEL REGISTRY CONFIGURATION
+# =============================================================================
+# Add new models here to make them available to the ModelFactory.
+# Uses YAML Anchors (&) and Aliases (*) to keep preprocessing DRY.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMON PREPROCESSING TEMPLATES
+# ─────────────────────────────────────────────────────────────────────────────
+templates:
+  imagenet_default: &imagenet_standard
+    resize: 256
+    center_crop: 224
+    normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+  # For ImageNet-100 Tiny-ImageNet
+  tiny_imagenet_default: &tiny_standard
+    resize: 224 
+    normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+  cifar10_default: &cifar10_standard
+    resize: 32
+    normalize:
+      mean: [0.4914, 0.4822, 0.4465]
+      std: [0.2023, 0.1994, 0.2010]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL DEFINITIONS
+# ─────────────────────────────────────────────────────────────────────────────
+models:
+  # --- ResNet Family ---
+  resnet18:
+    class_name: resnet18
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "ResNet-18: 18-layer residual network"
+    modifications:
+      fc: {type: linear, in_features_from: "fc.in_features"}
+    preprocessing:
+      imagenet: *imagenet_standard
+      cifar10: *cifar10_standard
+      imagenette: *imagenet_standard
+
+  resnet34:
+    class_name: resnet34
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "ResNet-34: 34-layer residual network"
+    modifications:
+      fc: {type: linear, in_features_from: "fc.in_features"}
+    preprocessing:
+      imagenet: *imagenet_standard
+
+  resnet50:
+    class_name: resnet50
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "ResNet-50: 50-layer bottleneck residual network"
+    modifications:
+      fc: {type: linear, in_features_from: "fc.in_features"}
+    preprocessing:
+      imagenet: *imagenet_standard
+
+  resnet101:
+    class_name: resnet101
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "ResNet-101: 101-layer residual network"
+    modifications:
+      fc: {type: linear, in_features_from: "fc.in_features"}
+    preprocessing:
+      imagenet: *imagenet_standard
+
+  # --- VGG Family ---
+  # Note: VGG models use a 'classifier' Sequential block. 
+  # We target index .6 which is the final Linear layer.
+  vgg11:
+    class_name: vgg11
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "VGG-11: 8 conv layers, 3 fully connected"
+    modifications:
+      classifier.6: {type: linear, in_features_from: "classifier.6.in_features"}
+    preprocessing:
+      imagenet: *imagenet_standard
+
+  vgg16:
+    class_name: vgg16
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "VGG-16: 13 conv layers, 3 fully connected"
+    modifications:
+      classifier.6: {type: linear, in_features_from: "classifier.6.in_features"}
+    preprocessing:
+      imagenet: *imagenet_standard
+
+  vgg19:
+    class_name: vgg19
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "VGG-19: 16 conv layers, 3 fully connected"
+    modifications:
+      classifier.6: {type: linear, in_features_from: "classifier.6.in_features"}
+    preprocessing:
+      imagenet: *imagenet_standard
+
+  # --- Lightweight / Mobile Models ---
+  mobilenet_v2:
+    class_name: mobilenet_v2
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "MobileNetV2: Efficient mobile-oriented architecture"
+    modifications:
+      classifier.1: {type: linear, in_features_from: "classifier.1.in_features"}
+    preprocessing:
+      imagenet: *imagenet_standard
+
+  squeezenet1_0:
+    class_name: squeezenet1_0
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "SqueezeNet 1.0: AlexNet-level accuracy with 50x fewer parameters"
+    modifications:
+      # SqueezeNet uses a Conv2d as the classifier head
+      classifier.1: {type: linear, in_features_from: "classifier.1.in_channels"}
+    preprocessing:
+      imagenet: *imagenet_standard
+
+  # --- Vision Transformers (Requires torchvision >= 0.12) ---
+  vit_b_16:
+    class_name: vit_b_16
+    module: torchvision.models
+    pretrained_param: pretrained
+    description: "Vision Transformer (ViT) Base/16"
+    modifications:
+      heads.head: {type: linear, in_features_from: "heads.head.in_features"}
+    preprocessing:
+      imagenet:
+        resize: 224
+        center_crop: 224
+        normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM TEMPLATE (Uncomment to use)
+# ─────────────────────────────────────────────────────────────────────────────
+#  my_custom_model:
+#    class_name: MyModelClass
+#    module: my_local_source.models
+#    pretrained_param: pretrained
+#    description: "Local custom architecture"
+#    modifications:
+#      final_layer: {type: linear, in_features_from: "final_layer.in_features"}
+#    preprocessing:
+#      imagenet: *imagenet_standard

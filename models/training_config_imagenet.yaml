@@ -1,0 +1,64 @@
+# Training Configuration for ImageNet
+# 
+# Uses pretrained ImageNet weights!
+# Perfect for transfer learning or fine-tuning
+
+# ─────────────────────────────────────────────────────────────────────
+# Model selection
+# ─────────────────────────────────────────────────────────────────────
+
+model: resnet50
+
+# ─────────────────────────────────────────────────────────────────────
+# Dataset
+# ─────────────────────────────────────────────────────────────────────
+
+num_classes: 1000  # ImageNet has 1000 classes
+
+# ─────────────────────────────────────────────────────────────────────
+# Training hyperparameters
+# ─────────────────────────────────────────────────────────────────────
+
+epochs: 100
+batch_size: 256
+lr: 0.01
+weight_decay: 1e-4
+optimizer: sgd
+momentum: 0.9
+
+# ─────────────────────────────────────────────────────────────────────
+# IMPORTANT: Load pretrained ImageNet weights!
+# ─────────────────────────────────────────────────────────────────────
+
+pretrained: true  # ← Load ImageNet weights!
+
+# ─────────────────────────────────────────────────────────────────────
+# Hooks (for activation capture / PAF analysis)
+# ─────────────────────────────────────────────────────────────────────
+
+hook_layers: "conv_linear"  # Capture Conv + Linear layers for analysis
+
+# ─────────────────────────────────────────────────────────────────────
+# Paths and device
+# ─────────────────────────────────────────────────────────────────────
+
+save_path: "outputs/resnet50_imagenet.pth"
+device: "cuda"
+
+# ─────────────────────────────────────────────────────────────────────
+# Config files location
+# ─────────────────────────────────────────────────────────────────────
+
+models_config_path: "models_config.yaml"
+
+# ─────────────────────────────────────────────────────────────────────
+# USAGE
+# ─────────────────────────────────────────────────────────────────────
+#
+# python train.py training_config_imagenet.yaml
+#
+# This will:
+# 1. Load ResNet-50 with ImageNet pretrained weights
+# 2. Train on ImageNet dataset (1000 classes)
+# 3. Use learning rate 0.01
+# 4. Capture activations for PAF analysis
