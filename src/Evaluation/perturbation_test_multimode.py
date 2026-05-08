@@ -6,12 +6,8 @@ import torchvision
 import torch.nn.functional as Fn
 from scipy.stats import wilcoxon
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-from pathlib import Path
-import sys
-parent_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(parent_dir)
-from PAF.paf import *
-from PAF.paf_visualizer import PAFVisualizer
+from core.paf import *
+from core.paf_visualizer import PAFVisualizer
 from Evaluation.xai_integration import *
 
 class PerturbationTestMultiMode:

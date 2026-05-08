@@ -5,22 +5,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from torchvision.models import ResNet18_Weights
-from pathlib import Path
-import sys
 from scipy import stats
 import pandas as pd
 
-parent_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(parent_dir)
-
 from Evaluation.VOC_bounding_box_dataset import get_voc_pointing_game_loader
 from Evaluation.utils_main import _paf_mode_key
-from PAF.paf import *
-from model_factory import ModelConfigLoader, ModelFactory, TrainingConfig
-from nn_arch.paf_hook_manager import PAFHookManager
-from PAF.paf_visualizer import PAFVisualizer
-from Evaluation.perturbation_test import *
-from Evaluation.randomization_test import *
+from core.paf import *
+from Evaluation.model_factory import ModelConfigLoader, ModelFactory, TrainingConfig
+from core.nn_graph import PAFHookManager
+from core.paf_visualizer import PAFVisualizer
 from Evaluation.randomization_test_multimode import *
 from Evaluation.perturbation_test_multimode import *
 from Evaluation.utils_main import *
@@ -28,7 +21,7 @@ import warnings
 from Evaluation.pointing_game import evaluate_pointing_game
 from Evaluation.bounding_box_dataset import *
 warnings.filterwarnings("ignore",category=UserWarning,module="captum")
-device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 labels=ResNet18_Weights.DEFAULT.meta["categories"]
 
 
@@ -76,9 +69,9 @@ def run_paf(model, model_name,test_samples,paf_modes,debug_level,dataset_name):
     #visualizer.visualize_all_layers_grid(x, key,save_path="PAF-output/" + model_name + "_" + dataset_name + "_" + mode_name + str(sample_id))
     #visualizer.visualize_layerwise_heatmaps(key,8,"PAF-output/heatmaps.png")
     #visualizer.visualize_canny_evolution(mode_key=key,cols=8,save_path="PAF-output/heatmaps_canny.png")
-    #visualizer.visualize_nips_killer_figure(x,true_label,save_path="PAF-output/heatmaps_canny.pdf")
+    visualizer.visualize_nips_killer_figure(x,true_label,save_path="PAF-output/heatmaps_canny.pdf")
     #loader=get_imagenet_pointing_game_loader("./data/imagenet-1k")
-    
+
     '''
     loader = get_imagenet_csv_loader(
         imagenet_root = './data/imagenet-1k',
@@ -88,11 +81,11 @@ def run_paf(model, model_name,test_samples,paf_modes,debug_level,dataset_name):
         num_workers   = 0,   # 0 for MPS to avoid multiprocessing issues
     )
     '''
-
+    '''
     loader = get_voc_pointing_game_loader(
     root        = './data/voc',   # downloads automatically
     max_samples = 1000,
-)
+    )
 
     results = evaluate_pointing_game(
         paf_class          = PAF,
@@ -106,7 +99,7 @@ def run_paf(model, model_name,test_samples,paf_modes,debug_level,dataset_name):
         use_baselines      = True,
     )
     print(results)
-
+    '''
 def main():
     '''
     parser = argparse.ArgumentParser(description="PAF Experiment Runner for NeurIPS Submission")
@@ -125,10 +118,10 @@ def main():
     args = parser.parse_args()
     '''
 
-    model, hook_manager, test_loader, config_data=load_model_dataset()
+    model, hook_manager, test_loader, config_data, device=load_model_dataset()
     
-    #test_sample=get_test_sample(test_loader, model, device)
-    test_sample=modify_testsample(test_loader.dataset[27026],model)
+    test_sample=get_test_sample(test_loader, model, device)
+    #test_sample=modify_testsample(test_loader.dataset[27026],model,device)
     model_name= config_data['model']['name']
     debug_level=config_data['experiment']['debug_level']
     dataset_name=config_data['dataset']['name']

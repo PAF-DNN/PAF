@@ -4,18 +4,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from torchvision.models import ResNet18_Weights
-from pathlib import Path
-import sys
 from scipy import stats
 import pandas as pd
-parent_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(parent_dir)
-from PAF.paf import *
-from model_factory import ModelConfigLoader, ModelFactory, TrainingConfig
-from nn_arch.paf_hook_manager import PAFHookManager
-from PAF.paf_visualizer import PAFVisualizer
-from Evaluation.perturbation_test import *
-from Evaluation.randomization_test import *
+from core.paf import *
+from Evaluation.model_factory import ModelConfigLoader, ModelFactory, TrainingConfig
+from core.nn_graph import PAFHookManager
+from core.paf_visualizer import PAFVisualizer
 from Evaluation.randomization_test_multimode import *
 from Evaluation.perturbation_test_multimode import *
 import yaml
@@ -36,18 +30,50 @@ def _paf_mode_key(mode) -> str:
             key = (mode, t)   
         return key # unicode \u03C4
 
+def resolve_device(device_config: str = "auto") -> torch.device:
+    if not isinstance(device_config, str):
+        print(f"Invalid device config {device_config!r}; falling back to auto.")
+        device_config = "auto"
+
+    device_config = device_config.lower().strip()
+
+    if device_config == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    try:
+        device = torch.device(device_config)
+    except RuntimeError:
+        print(f"Invalid device '{device_config}'; falling back to CPU.")
+        return torch.device("cpu")
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("CUDA requested but not available; falling back to CPU.")
+        return torch.device("cpu")
+
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        print("MPS requested but not available; falling back to CPU.")
+        return torch.device("cpu")
+
+    return device
+
+
 def load_model_dataset():
 
-    config_data=load_config("Evaluation/config.yaml")
+    config_data=load_config("config/evaluation_config.yaml")
     model_name = config_data['model']['name']
     model_config_path=config_data['model']['model_config_path']
     dataset_name = config_data['dataset']['name']
     dataset_path= config_data['dataset']['path']
-    shuffle=config_data['experiment']['random_sample']
+    experiment_config = config_data.get('experiment', {})
+    shuffle=experiment_config.get('random_sample', False)
     batch_size = config_data['dataset']['batch_size']
-
+    device= resolve_device(experiment_config.get('device', 'auto'))
     # 1. Initialize Factory and Config
-    loader = ModelConfigLoader("models/models_config.yaml")
+    loader = ModelConfigLoader("config/models_config.yaml")
     factory = ModelFactory(loader)
     # data_path contains 'val' and 'train' subdirectories.
     test_config = TrainingConfig(
@@ -73,9 +99,9 @@ def load_model_dataset():
     hook_manager = PAFHookManager(model)
     print("Loading Validation samples...")
     test_loader = factory.get_dataloader(model_name=test_config.model,subset="val", config=test_config)
-    return model, hook_manager, test_loader, config_data
+    return model, hook_manager, test_loader, config_data, device
 
-def modify_testsample(testset,model):
+def modify_testsample(testset,model,device):
     x, y = testset
     x=x.unsqueeze(0)
     x = x.to(device)

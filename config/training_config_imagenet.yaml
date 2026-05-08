@@ -49,13 +49,13 @@ device: "cuda"
 # Config files location
 # ─────────────────────────────────────────────────────────────────────
 
-models_config_path: "models_config.yaml"
+models_config_path: "config/models_config.yaml"
 
 # ─────────────────────────────────────────────────────────────────────
 # USAGE
 # ─────────────────────────────────────────────────────────────────────
 #
-# python train.py training_config_imagenet.yaml
+# python train.py config/training_config_imagenet.yaml
 #
 # This will:
 # 1. Load ResNet-50 with ImageNet pretrained weights

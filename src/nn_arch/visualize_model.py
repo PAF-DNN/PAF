@@ -11,11 +11,6 @@ from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 import torchvision.models as models
 
-import sys
-from pathlib import Path
-
-parent_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(parent_dir)
 from nn_arch.visualize_architecture_graphviz import draw_resnet_no_overlap
 
 

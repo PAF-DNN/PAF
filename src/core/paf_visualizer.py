@@ -1,8 +1,6 @@
 import dis
 import re
-import sys
 import os
-from pathlib import Path
 from graphviz import Digraph
 import torch
 import torch.fx as fx
@@ -18,13 +16,10 @@ import cv2
 import matplotlib.gridspec as gridspec
 from matplotlib.patches import ConnectionPatch
 
-parent_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(parent_dir)
-
 #from nn_arch.cnn_mnist import CNN, transform,  device, load_model
-from PAF.paf import PAF, ScoringMode
-#from PAF.cnn_analysis import analyze_feature_coalitions
-from nn_arch.paf_hook_manager import PAFHookManager, make_model_universal_for_shap
+from core.paf import PAF, ScoringMode
+#from core.cnn_analysis import analyze_feature_coalitions
+from core.nn_graph import PAFHookManager, make_model_universal_for_shap
 from captum.attr import IntegratedGradients, LRP, LayerLRP, DeepLiftShap
 from captum.attr import LRP
 from pytorch_grad_cam import GradCAMPlusPlus
@@ -41,6 +36,12 @@ class PAFVisualizer:
         self.true_class=true_class
         self.target_class=target_class
         self.sample_idx=0
+
+    def _ensure_save_dir(self, save_path: str) -> None:
+        if save_path:
+            save_dir = os.path.dirname(save_path)
+            if save_dir and not os.path.exists(save_dir):
+                os.makedirs(save_dir, exist_ok=True)
 
     def get_input_heatmap(self,p_in, sample_idx=0, blur_sigma=0.8, percentile=98.5,mode='visualize'):
         """
@@ -1939,7 +1940,7 @@ class PAFVisualizer:
             ha='center', va='top',
             fontsize=12, fontweight='bold', color='#1f77b4',
         )
-        '''
+        r'''
         # ----------------------------------------------------------------
         # Shared caption
         # ----------------------------------------------------------------
@@ -1957,8 +1958,12 @@ class PAFVisualizer:
         # ----------------------------------------------------------------
         # Save
         # ----------------------------------------------------------------
-        plt.tight_layout(rect=[0, 0.01, 1, 0.99])
+        try:
+            plt.tight_layout(rect=[0, 0.01, 1, 0.99])
+        except:
+            pass
         if save_path:
+            self._ensure_save_dir(save_path)
             plt.savefig(save_path, bbox_inches='tight',
                         dpi=300, facecolor=FIG_BG)
             print(f"Saved: {save_path}")
@@ -2671,7 +2676,7 @@ class PAFVisualizer:
 
         # 2. Identify and Filter Conv Layers (Excluding downsample)
         # Using your preferred filtering logic
-        '''
+        r'''
         all_layers = self.paf.find_layers_with_types(mode=key, layer_type='conv')
         layers = [lname for lname in all_layers if "downsample" not in lname.lower()]
         # 3. Sort Layers (Low-to-High / Input-to-Output)
@@ -2763,7 +2768,7 @@ class PAFVisualizer:
             print(f"Key {key} not found in distributions.")
             return
 
-        '''
+        r'''
         # 2. Identify and Filter Conv Layers (same as Canny method)
         all_layers = self.paf.find_layers_with_types(mode=key, layer_type='conv')
         layers = [lname for lname in all_layers if "downsample" not in lname.lower()]
@@ -3492,6 +3497,7 @@ class PAFVisualizer:
         ax.set_ylabel("Total Probability Mass")
         ax.legend()
         plt.title("Channel Importance")
+        self._ensure_save_dir("PAF-output/channel_importance.png")
         plt.savefig("PAF-output/channel_importance" + ".png")
 
     def get_coactivation_diff(self,p_true, p_pred, top_k=10):
@@ -3560,6 +3566,7 @@ class PAFVisualizer:
         axes[1].imshow(masked_img)
         axes[1].set_title("Top 5% Mass Deviation Regions")
         plt.title("New Experiment")
+        self._ensure_save_dir("PAF-output/new_experiment.png")
         plt.savefig("PAF-output/new_experiment" + ".png")
     
 

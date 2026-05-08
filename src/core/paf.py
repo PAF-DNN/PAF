@@ -36,20 +36,15 @@ import torchvision
 import torchvision.transforms as transforms
 from typing import Union, Dict, List, Optional, Tuple
 import warnings
-from nn_arch.cnn_mnist import CNN, transform,  device
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 from types import SimpleNamespace
 from memory_profiler import profile
 
-from pathlib import Path
-import sys
 import gc
 
-parent_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(parent_dir)
-from nn_arch.paf_hook_manager import PAFHookManager
+from core.nn_graph import PAFHookManager
 
 from enum import Enum
 from typing import Callable
@@ -137,7 +132,9 @@ class PAF:
             self.output_mode="target"
         else:
             self.output_mode=output_mode
-        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device=torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+        self.model.to(self.device)
+        self.hook_manager.model.to(self.device)
         if modes is None:
             modes = [(scoring_mode, {'tau': tau})]
         self._modes = modes
@@ -146,7 +143,7 @@ class PAF:
 
         # Results — one dict per mode
         self.distributions        : Dict[tuple, Dict[str, torch.Tensor]] = {}
-        self.edge_mass        = {key: {} for key in self._score_fns}
+        self.edge_mass: Dict[tuple, Dict] = {}
         self._unfold_cache: Dict[str, torch.Tensor] = {}
         self.activations={}
         self.redistribute_param_mass = redistribute_param_mass
@@ -2553,7 +2550,7 @@ class PAF:
         """
         Entry function to run PAF on a single input sample. 
         """
-        x = x.to(device)
+        x = x.to(self.device)
         if output_mode is not None:
             self.output_mode=output_mode
         #hook_manager = PAFHookManager(self.model)

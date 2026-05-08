@@ -7,15 +7,16 @@ experiment:
   analyze_multimode: true
   debug_level: 0
   random_sample: False
-  yaml_config_path: "models/models_config.yaml"
-  sample_idx: 0    
+  yaml_config_path: "config/models_config.yaml"
+  sample_idx: 0   
+  device: "auto" 
   
 
 
 # Model Configuration
 model:
-  name: "vgg16" # options: "vit_b_16", "resnet18", "resnet34", "resnet50", "resnet101"
-  model_config_path: "models/models_config.yaml"
+  name: "resnet18" # options: "vit_b_16", "resnet18", "resnet34", "resnet50", "resnet101"
+  model_config_path: "config/models_config.yaml"
 
 # Dataset Configuration
 dataset:
@@ -27,7 +28,7 @@ dataset:
 
 # Benchmarking Parameters
 benchmarking:
-  test_runs: 100
+  test_runs: 1
   patch_size: 3 # area for insertion/deletion tests
 
 # PAF Modes

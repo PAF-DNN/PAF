@@ -4,21 +4,13 @@ import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter
 from torchvision.models import ResNet18_Weights
-from pathlib import Path
-import sys
 from scipy import stats
 import pandas as pd
 
-
-parent_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(parent_dir)
-
-from PAF.paf import *
-from model_factory import ModelConfigLoader, ModelFactory, TrainingConfig
-from nn_arch.paf_hook_manager import PAFHookManager
-from PAF.paf_visualizer import PAFVisualizer
-from Evaluation.perturbation_test import *
-from Evaluation.randomization_test import *
+from core.paf import *
+from Evaluation.model_factory import ModelConfigLoader, ModelFactory, TrainingConfig
+from core.nn_graph import PAFHookManager
+from core.paf_visualizer import PAFVisualizer
 from Evaluation.randomization_test_multimode import *
 from Evaluation.perturbation_test_multimode import *
 import warnings
@@ -30,7 +22,7 @@ model_name="resnet18"
 dataset_name="imagenet"
 #dataset_path='./data/imagenette'
 dataset_path="./data/imagenet-1k"
-yaml_config_path="models/models_config.yaml"
+yaml_config_path="config/models_config.yaml"
 analyze_misclassification=False   # Set to False to analyze mispredictions instead
 contrastive_interpretation=True
 random_sample=True
@@ -61,7 +53,7 @@ def tensor_to_display(x_tensor):
     # 1. Remove batch dim and move to CPU
     # x shape: [1, 3, 224, 224] -> [3, 224, 224]
     img = x_tensor.squeeze().cpu().detach()
-    
+
     # 2. Inverse ImageNet Normalization
     # These are the standard ImageNet values used during training
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -582,7 +574,7 @@ def get_test_sample(test_loader, model, device,misclassification=False,random_sa
 
     
 def run_purturbation_tests_all_model():
-    loader = ModelConfigLoader("models/models_config.yaml")
+    loader = ModelConfigLoader("config/models_config.yaml")
     factory = ModelFactory(loader)
     #models=['resnet18','resnet34','resnet50','vgg16','vgg19','vit_b_16']
     models=['resnet18']
@@ -729,7 +721,7 @@ def run_perturbation_tests(
 def main():
 
     # 1. Initialize Factory and Config
-    loader = ModelConfigLoader("models/models_config.yaml")
+    loader = ModelConfigLoader("config/models_config.yaml")
     factory = ModelFactory(loader)
 
     # data_path contains 'val' and 'train' subdirectories.
@@ -776,7 +768,7 @@ def main():
     #run_single_test(hook_manager, test_loader, model, device)
 
 def run_randomization_tests_all_model():
-    loader = ModelConfigLoader("models/models_config.yaml")
+    loader = ModelConfigLoader("config/models_config.yaml")
     factory = ModelFactory(loader)
     #models=['resnet18','resnet34','resnet50','vgg16','vgg19','vit_b_16']
     models=['vgg16']
@@ -909,10 +901,9 @@ def plot_specific_randomization(df, test_type="weight"):
 
     g.add_legend()
     plt.savefig(f"PAF-output/{test_type}_randomization_final_results.pdf", bbox_inches='tight')
-    plt.show()   
+    plt.show()
 
 if __name__ == "__main__":
     #main()
     #run_purturbation_tests_all_model()
     run_randomization_tests_all_model()
-    

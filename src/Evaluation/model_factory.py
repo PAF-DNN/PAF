@@ -10,8 +10,6 @@ Combines all model operations:
 Single source of truth for all model operations.
 """
 
-import sys
-
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -25,9 +23,6 @@ import importlib
 from torchvision.datasets import ImageFolder
 import os
 from datasets import load_dataset
-
-parent_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(parent_dir)
 
 # ============================================================================
 # SECTION 1: MODEL DEFINITIONS & CONFIG
@@ -56,7 +51,7 @@ class ModelDefinition:
 class ModelConfigLoader:
     """Load model definitions and preprocessing from YAML"""
     
-    def __init__(self, config_path: str = "models_config.yaml"):
+    def __init__(self, config_path: str = "config/models_config.yaml"):
         self.config_path = Path(config_path)
         self.models: Dict[str, ModelDefinition] = {}
         self.load_config()
@@ -270,7 +265,7 @@ class ModelFactory:
     def get_dataloader(
         self,
         model_name: str,
-        subset: str = "train",
+        subset: str = "val",
         config: Optional["TrainingConfig"] = None,
         ) -> DataLoader:
         """
@@ -491,7 +486,7 @@ class TrainingConfig:
     save_path: Optional[str] = None
     load_path: Optional[str] = None
     device: str = "cuda"
-    models_config_path: str = "models_config.yaml"
+    models_config_path: str = "config/models_config.yaml"
     dataset: str = "imagenet"  # For transforms
     shuffle:bool = False
     
@@ -652,7 +647,7 @@ def load_model(model: nn.Module, path: str, device: torch.device) -> nn.Module:
 def create_model(
     model_name: str,
     num_classes: int,
-    config_path: str = "models_config.yaml",
+    config_path: str = "config/models_config.yaml",
     pretrained: bool = False,
 ) -> nn.Module:
     """Quick function to create model"""
@@ -663,7 +658,7 @@ def create_model(
 
 def get_transforms(
     model_name: str,
-    config_path: str = "models_config.yaml",
+    config_path: str = "config/models_config.yaml",
     dataset: str = "imagenet",
     augment: bool = False,
 ) -> transforms.Compose:
@@ -681,7 +676,7 @@ if __name__ == "__main__":
 
     # Load it
     print("\nLoading model config...")
-    loader = ModelConfigLoader("Generated/models_config_example.yaml")
+    loader = ModelConfigLoader("config/models_config_example.yaml")
     loader.print_summary()
     
     # Create factory

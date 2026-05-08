@@ -13,17 +13,12 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.stats import spearmanr
 import pandas as pd
 import seaborn as sns
-from pathlib import Path
-import sys
 import tracemalloc
 import time
 
-parent_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(parent_dir)
-
 from Evaluation.xai_integration import *
-from PAF.paf import *
-from PAF.paf_visualizer import PAFVisualizer
+from core.paf import *
+from core.paf_visualizer import PAFVisualizer
 
 
 class RandomizationTestMultiMode:
