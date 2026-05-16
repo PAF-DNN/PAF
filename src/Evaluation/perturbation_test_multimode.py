@@ -1,3 +1,4 @@
+from scipy import stats
 import torch
 import os
 import numpy as np
@@ -6,15 +7,21 @@ import torchvision
 import torch.nn.functional as Fn
 from scipy.stats import wilcoxon
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-from core.paf import *
-from core.paf_visualizer import PAFVisualizer
-from Evaluation.xai_integration import *
+from Evaluation.utils_main import get_sample_image
+from core.paf.scoring import ScoringMode
+from core.paf.utils import make_mode_name
+from core.visualization.visualizer import PAFVisualizer
+from core.paf.graph.manager import PAFGraphManager
+from Evaluation.xai_integration import XAI
+from Evaluation.eval_core.paf_runner import PAFRunner
+from Evaluation.eval_core.baseline_runner import BaselineRunner
+from Evaluation.eval_core.metrics import compute_similarity_scores, _compute_audc, _compute_auic
 
 class PerturbationTestMultiMode:
     def __init__(
         self,
         model,
-        hook_manager:               PAFHookManager,
+        graph_manager:             PAFGraphManager,
         model_name :                str= "",
         analyze_misclassification:  bool = False,
         contrastive_interpretation: bool = False,
@@ -31,28 +38,25 @@ class PerturbationTestMultiMode:
         self.visualize_heatmap         = visualize_heatmap
         self.patch_size                = patch_size
         self.model_name                = model_name
-        self.hook_manager               = hook_manager
+        self.graph_manager             = graph_manager
         # PAF scoring modes — default to ABS for backward compatibility
         if paf_modes is None:
             self.paf_modes = [(ScoringMode.ABS, {'tau': 1.0})]
         else:
             self.paf_modes = paf_modes
 
+        # Initialize core runners
+        self._paf_runner = PAFRunner(model, graph_manager, paf_modes)
+        self._baseline_runner = BaselineRunner(model, None)
+        
         # Human-readable name per PAF mode e.g. 'PAF_abs_tau1.0'
-        self.paf_method_names = [
-            self._paf_mode_name(mode, kwargs)
-            for mode, kwargs in self.paf_modes
-        ]
+        self.paf_method_names = self._paf_runner.mode_names(self.paf_modes)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _paf_mode_name(mode: ScoringMode, kwargs: dict) -> str:
-        tau = kwargs.get('tau', 1.0)
-        return f"PAF-{mode.value} τ = {tau}" # unicode \u03C4
-
+    
     @staticmethod
     def _auto_style(method_names):
         """
@@ -89,54 +93,19 @@ class PerturbationTestMultiMode:
         PAF: one entry per scoring mode, single forward pass.
         """
         results = {}
+        H, W = x.shape[-2], x.shape[-1]
 
-        # Baselines
-        for name, fn in [
-            ('IG',       lambda: self.xai.get_integrated_gradient_map(x, true_label)),
-            ('GCAM',     lambda: self.xai.get_gradcam_map(x, true_label)),
-            ('LRP',      lambda: self.xai.get_lrp_map(x, true_label)),
-            ('DEEPSHAP', lambda: self.xai.get_deepshap_heatmap(x, true_label)),
-        ]:
-            try:
-                results[name] = fn()
-            except Exception as e:
-                print(f"{name} failed: {e}")
-                results[name] = None
+        # Baselines using core runner
+        baseline_results = self._baseline_runner.run(x, true_label, H, W)
+        results.update(baseline_results)
 
-        # PAF — all modes in one pass
+        # PAF — all modes in one pass using core runner
         try:
-            paf = PAF(
-                model        = self.model,
-                x            = x,
-                target_class = true_label,
-                true_class   = true_label,
-                output_mode  = "target",
-                modes        = self.paf_modes,
-            )
-            paf_visualizer = PAFVisualizer(
-                paf,
-                misclassification       = self.analyze_misclassification,
-                contrastive_explanation = self.contrastive_explanation,
-                true_class              = true_label,
-                target_class            = paf_predicted,
-            )
-
-            for (mode, kwargs), method_name in zip(
-                self.paf_modes, self.paf_method_names
-            ):
-                mode_key = (mode, kwargs.get('tau', 1.0))
-                try:
-                    results[method_name] = paf_visualizer.get_heatmap_per_mode(
-                        mode_key   = mode_key,
-                        sample_idx = self.sample_idx,
-                        use_mode       = 'evaluate',
-                    )
-                except Exception as e:
-                    print(f"PAF heatmap failed for {method_name}: {e}")
-                    results[method_name] = None
-
-            paf.cleanup()
-            del paf, paf_visualizer
+            with self._paf_runner:
+                paf_heatmaps = self._paf_runner.get_heatmaps(
+                    x, true_label, 'x', H, W, true_label
+                )
+                results.update(paf_heatmaps)
 
         except Exception as e:
             print(f"PAF failed: {e}")
@@ -379,7 +348,90 @@ class PerturbationTestMultiMode:
         plt.savefig(f"PAF-output/insertion_deletion_results_{idx}.png", dpi=300)
         plt.close()
 
-    def plot_aggregated_results(self, steps, del_matrix, ins_matrix, method_names):
+    def plot_aggregated_results(self, steps, del_matrix, ins_matrix, method_names, audc, auic):
+        """
+        Aggregated mean +/- std curves for all methods.
+        audc, auic: dicts {method_name: np.array of per-sample scores}
+        — passed in from compute_aggregate_statistics so AUDC/AUIC
+        labels match the table values exactly.
+        """
+        styles  = self._auto_style(method_names)
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        for name in method_names:
+            s = styles.get(name, {
+                'color': 'black', 'marker': 'x', 'ls': '-', 'lw': 1.5
+            })
+
+            # Deletion
+            del_mean = del_matrix[name].mean(axis=0)
+            del_std  = del_matrix[name].std(axis=0)
+            # Use pre-computed AUDC from compute_aggregate_statistics
+            audc_val = audc[name].mean()
+
+            axes[0].plot(
+                steps, del_mean,
+                color=s['color'], marker=s['marker'],
+                linestyle=s['ls'], lw=s['lw'],
+                label=f"{name} (AUDC={audc_val:.3f})"
+            )
+            axes[0].fill_between(
+                steps,
+                del_mean - del_std,
+                del_mean + del_std,
+                alpha=0.12, color=s['color']
+            )
+
+            # Insertion
+            ins_mean = ins_matrix[name].mean(axis=0)
+            ins_std  = ins_matrix[name].std(axis=0)
+            auic_val = auic[name].mean()
+
+            axes[1].plot(
+                steps, ins_mean,
+                color=s['color'], marker=s['marker'],
+                linestyle=s['ls'], lw=s['lw'],
+                label=f"{name} (AUIC={auic_val:.3f})"
+            )
+            axes[1].fill_between(
+                steps,
+                ins_mean - ins_std,
+                ins_mean + ins_std,
+                alpha=0.12, color=s['color']
+            )
+
+        for ax, title, xlabel in zip(
+            axes,
+            ["Deletion — Faithfulness (lower is better)",
+            "Insertion — Sufficiency (higher is better)"],
+            ["% Pixels Removed", "% Pixels Inserted"],
+        ):
+            ax.axhline(
+                y=0.1, color='black', linestyle=':', lw=1.2,
+                label='Random Chance'
+            )
+            ax.set_xlabel(xlabel, fontsize=12)
+            ax.set_ylabel("Mean Model Confidence", fontsize=12)
+            ax.set_title(title, fontsize=13, fontweight='bold')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(-0.05, 1.05)
+            ax.set_xlim(steps[0], steps[-1])
+
+        plt.suptitle(
+            f"Perturbation Faithfulness Test — {self.model_name}",
+            fontsize=14, fontweight='bold', y=1.02
+        )
+        plt.tight_layout()
+        os.makedirs("PAF-output", exist_ok=True)
+        plt.savefig(
+            f"PAF-output/aggregated_results_{self.model_name}.png",
+            dpi=150, bbox_inches='tight'
+        )
+        plt.close()
+        return fig
+
+    def plot_aggregated_results_old(self, steps, del_matrix, ins_matrix, method_names):
         """
         Aggregated mean +/- std curves for all methods.
         """
@@ -437,8 +489,8 @@ class PerturbationTestMultiMode:
         """
         del_matrix = {n: np.array(all_results[n]['del']) for n in method_names}
         ins_matrix = {n: np.array(all_results[n]['ins']) for n in method_names}
-        audc = {n: del_matrix[n].mean(axis=1) for n in method_names}
-        auic = {n: ins_matrix[n].mean(axis=1) for n in method_names}
+        audc = {n: _compute_audc(del_matrix[n]) for n in method_names}
+        auic = {n: _compute_auic(ins_matrix[n]) for n in method_names}        
 
         audc_mat    = np.stack([audc[n] for n in method_names], axis=1)
         auic_mat    = np.stack([auic[n] for n in method_names], axis=1)
@@ -581,7 +633,246 @@ class PerturbationTestMultiMode:
 
 # Auxiliary methods
 
-def plot_neurips_aggregate(steps, global_metrics):
+def run_perturbation_tests(
+    test_loader,
+    model,
+    device,
+    graph_manager,
+    n_samples   :int  = 100,
+    model_name  :str="",
+    paf_modes   :list = None,
+    random_sample:bool = True,
+    visualize_heatmap: bool = False,
+):
+    collected         = 0
+    sample_id         = 0
+
+    ptest = PerturbationTestMultiMode(
+        model                      = model,
+        model_name                 = model_name,
+        graph_manager               = graph_manager,
+        paf_modes                  = paf_modes,
+    )
+
+    # Build method names dynamically from what PerturbationTest will produce
+    baseline_names = ["GradCAM++", "IG", "LRP", "DeepSHAP"]
+    paf_names      = ptest.paf_method_names
+    method_names   = baseline_names + paf_names
+
+    all_results = {name: {'del': [], 'ins': []} for name in method_names}
+
+    while collected < n_samples:
+        test_sample = get_sample_image(
+            test_loader, model, device,
+            random_sample,
+            samples_checked=sample_id
+        )
+        idx, x, y, predicted, sample_id = test_sample
+        true_label = y.item() if isinstance(y, torch.Tensor) else y
+
+        try:
+            steps, results = ptest.run_perturbation_tests(
+                x=x, true_label=true_label, paf_predicted=predicted, device=device, idx=idx
+            )
+
+            # Accumulate — only store methods that succeeded
+            for name, res in results.items():
+                if name in all_results:
+                    for k in ('del', 'ins'):
+                        all_results[name][k].append(res[k])
+                else:
+                    # Method appeared that was not in our initial list
+                    # (should not happen but handle gracefully)
+                    all_results[name] = {'del': [res['del']], 'ins': [res['ins']]}
+                    method_names.append(name)
+                    print(f"New method added to results: {name}")
+
+            collected += 1
+            sample_id += 1
+
+            if visualize_heatmap:
+                ptest.plot_faithfulness_single_test(steps, results, idx)
+
+            print(f"[{collected}/{n_samples}] sample {idx} done")
+
+        except Exception as e:
+            print(f"Sample {idx} failed: {e} — skipping")
+            sample_id += 1
+            continue
+
+    return steps, all_results
+
+
+def plot_neurips_aggregate(steps, del_matrix, ins_matrix, audc, auic):
+    """
+    steps:      list of x-axis values (percentages)
+    del_matrix: {method: np.array(n_samples, n_steps)}
+    ins_matrix: {method: np.array(n_samples, n_steps)}
+    audc:       {method: np.array(n_samples)} — pre-computed by compute_aggregate_statistics
+    auic:       {method: np.array(n_samples)} — pre-computed by compute_aggregate_statistics
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.lines import Line2D
+    import os
+
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "legend.fontsize": 8,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
+
+    BASE_COLORS = {
+        "IG":       "#1f77b4",
+        "GradCAM++":     "#7f7f7f",
+        "LRP":      "#2ca02c",
+        "DeepSHAP": "#d7ff0e",
+    }
+
+    def _auto_style(method_names):
+        base_styles = {
+            name: {"color": color, "marker": None,
+                   "ls": "--", "lw": 1, "alpha": 0.9}
+            for name, color in BASE_COLORS.items()
+        }
+        paf_styles = {
+            'abs': {
+                'color': '#E31A1C', 'ls': '-',
+                'lw': 1.5, 'marker': 'o', 'ms': 5
+            },
+            'norm': {
+                'color': "#FBB299D7", 'ls': (0, (3, 1, 1, 1)),
+                'lw': 1.5, 'marker': 'p', 'ms': 5
+            },
+            'power': {
+                'color': "#FF8000E9", 'ls': (0, (5, 5)),
+                'lw': 2.5, 'marker': '^', 'ms': 5
+            },
+            'norm_power': {
+                'color': "#6A3D9AE3", 'ls': '-',
+                'lw': 2.5, 'marker': 'X', 'ms': 8
+            }
+        }
+        styles = dict(base_styles)
+        for name in method_names:
+            matched = False
+            for key, cfg in paf_styles.items():
+                if key in name:
+                    styles[name] = cfg
+                    matched = True
+                    break
+            '''  
+            if not matched:
+                styles[name] = {
+                    'color': 'black', 'ls': '-',
+                    'lw': 2.0, 'marker': 'x'
+                }
+                '''
+        return styles
+
+    method_names  = list(del_matrix.keys())
+    styles        = _auto_style(method_names)
+    x_coords      = np.array(steps)
+    fig, axes     = plt.subplots(1, 2, figsize=(13, 4))
+    ax_ins, ax_del = axes
+    legend_storage = {"ins": [], "del": []}
+    PAF_MODES = ['norm_power', 'norm', 'power', 'abs']
+    def _draw_order(name):
+        for i, mode in enumerate(PAF_MODES):
+            if mode in name:
+                return i + 100   # PAF drawn after baselines
+        return 0   # baselines drawn first
+
+    sorted_methods = sorted(method_names, key=_draw_order)
+    for method in sorted_methods:
+        if method not in del_matrix or method not in ins_matrix:
+            print(f"Skipping {method}: Missing matrix data.")
+            continue
+
+        style  = styles.get(method, {"color": "black"})
+        is_paf = any(mode in method for mode in PAF_MODES)
+
+        # ── CHANGED: use pre-computed audc/auic instead of recomputing ──
+        auc_del = audc[method].mean()   # scalar — mean over samples
+        auc_ins = auic[method].mean()   # scalar — mean over samples
+
+        for ax, matrix, auc_val, key in zip(
+            [ax_ins,      ax_del],
+            [ins_matrix,  del_matrix],
+            [auc_ins,     auc_del],
+            ["ins",       "del"],
+        ):
+            data = matrix[method]           # (n_samples, n_steps)
+            mean = data.mean(axis=0)        # (n_steps,)
+            sem  = data.std(axis=0) / np.sqrt(data.shape[0])
+
+            ax.plot(
+                x_coords, mean,
+                **style,
+                zorder=10 if is_paf else 5
+            )
+
+            if is_paf:
+                alpha     = 0.25 if 'abs' in method else 0.06
+                edgecolor = style["color"] if 'abs' in method else 'none'
+                zorder    = 12 if 'abs' in method else 7
+
+                ax.fill_between(
+                    x_coords,
+                    mean - sem,
+                    mean + sem,
+                    color=style["color"],
+                    alpha=alpha,
+                    edgecolor=edgecolor,
+                    linewidth=0.5,
+                    zorder=zorder,
+                )
+
+            # ── CHANGED: label uses pre-computed AUC ──
+            label  = f"{method} ({auc_val:.3f})"
+            handle = Line2D([0], [0], **style, label=label)
+            legend_storage[key].append((auc_val, handle))
+
+    for ax, title, xlabel, key in zip(
+        [ax_ins,                        ax_del],
+        ["Insertion: Confidence ↑",     "Deletion: Confidence ↓"],
+        ["% pixels inserted",           "% pixels deleted"],
+        ["ins",                         "del"],
+    ):
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Confidence")
+        ax.set_xlim(x_coords[0], x_coords[-1])
+        ax.set_xticks(np.linspace(x_coords[0], x_coords[-1], 3))
+        ax.set_xticklabels(["0%", "50%", "100%"])
+        ax.set_ylim(-0.02, 1.05)
+        ax.grid(True, linestyle=":", alpha=0.3)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+        legend_storage[key].sort(
+            key=lambda x: x[0],
+            reverse=(key == "ins")
+        )
+        ax.legend(
+            handles=[h for _, h in legend_storage[key]],
+            loc="lower right" if key == "ins" else "upper right",
+            frameon=True, framealpha=0.5, fontsize=6,
+        )
+
+    plt.tight_layout()
+    os.makedirs("PAF-output", exist_ok=True)
+    plt.savefig("PAF-output/NeurIPS_Faithfulness.pdf", bbox_inches="tight")
+    plt.savefig("PAF-output/NeurIPS_Faithfulness.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+def plot_neurips_aggregate_old(steps, global_metrics):
     import matplotlib.pyplot as plt
     import numpy as np
     from matplotlib.lines import Line2D
@@ -803,8 +1094,95 @@ def plot_neurips_aggregate(steps, global_metrics):
             except Exception:
                 return 0.0
         return sorted(handles, key=extract_auc, reverse=not ascending)
+def generate_summary_table(
+    stats,           # from compute_aggregate_statistics
+    audc,            # from compute_aggregate_statistics
+    auic,            # from compute_aggregate_statistics
+    method_names,    # list of method names in order
+    output_dir="PAF-output",
+    filename="summary_table.txt"
+):
+    table_lines = []
 
-def generate_summary_table(global_metrics, output_dir="PAF-output", filename="summary_table.txt"):
+    def smart_print(text):
+        print(text)
+        table_lines.append(text)
+
+    def effect_label(d):
+        ad = abs(d)
+        if ad >= 0.8: return "large"
+        if ad >= 0.5: return "medium"
+        if ad >= 0.2: return "small"
+        return "negligible"
+
+    def sig_label(p):
+        if p is None:  return "  —"
+        if p < 0.001:  return "***"
+        if p < 0.01:   return " **"
+        if p < 0.05:   return "  *"
+        return "n.s."
+
+    # ── REMOVED: AUC recomputation block ──
+    # ── CHANGED: use pre-computed audc/auic directly ──
+
+    # Identify reference method — same logic as compute_aggregate_statistics
+    ref = next(
+        (n for n in ["DEEPSHAP", "GCAM"] if n in method_names),
+        method_names[0]
+    )
+
+    col_w = max(25, max(len(n) for n in method_names) + 2)
+    sep   = "=" * (col_w + 100)
+
+    smart_print(f"\n{sep}")
+    smart_print(
+        f"{'Method':<{col_w}} {'AUDC (Del) ↓':>18} {'AUIC (Ins) ↑':>18} "
+        f"{'p Del':>6} {'p Ins':>6} "
+        f"{'d Del':>22} {'d Ins':>22}"
+    )
+    smart_print(sep)
+
+    for name in method_names:
+        # ── CHANGED: read directly from pre-computed stats/audc/auic ──
+        s         = stats[name]
+        audc_mean = s['audc_mean']
+        audc_std  = s['audc_std']
+        auic_mean = s['auic_mean']
+        auic_std  = s['auic_std']
+        p_del     = s['p_del']
+        p_ins     = s['p_ins']
+        d_del     = s['d_del']
+        d_ins     = s['d_ins']
+
+        lbl = (name + " [ref]") if name == ref else name
+        row = (
+            f"{lbl:<{col_w}} "
+            f"{audc_mean:.3f}+/-{audc_std:.3f}    "
+            f"{auic_mean:.3f}+/-{auic_std:.3f}  "
+            f"{sig_label(p_del):>6} "
+            f"{sig_label(p_ins):>6}  "
+        )
+
+        if d_del is not None:
+            row += (
+                f"{d_del:7.3f} ({effect_label(d_del):>10})  "
+                f"{d_ins:7.3f} ({effect_label(d_ins):>10})"
+            )
+        else:
+            row += "  —                         —"
+        smart_print(row)
+
+    smart_print(sep)
+    smart_print(
+        f"Reference Baseline: {ref} | Wilcoxon Rank-Sums test | "
+        f"*** p<0.001 ** p<0.01 * p<0.05"
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, filename), "w", encoding="utf-8") as f:
+        f.write("\n".join(table_lines))
+
+def generate_summary_table_old(global_metrics, output_dir="PAF-output", filename="summary_table.txt"):
     """
     Aggregates results across models/runs, prints a NeurIPS-ready table, 
     and saves the exact output to a text file.

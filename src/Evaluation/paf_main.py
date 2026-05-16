@@ -10,10 +10,13 @@ import pandas as pd
 
 from Evaluation.VOC_bounding_box_dataset import get_voc_pointing_game_loader
 from Evaluation.utils_main import _paf_mode_key
-from core.paf import *
-from Evaluation.model_factory import ModelConfigLoader, ModelFactory, TrainingConfig
-from core.nn_graph import PAFHookManager
-from core.paf_visualizer import PAFVisualizer
+from core.paf.paf import PAF
+from core.paf.scoring import ScoringMode
+from core.paf.utils import parse_mode_from_string
+from core.model.config import ModelConfig, DataConfig
+from core.model.factory import ModelFactory
+from core.paf.graph.manager import PAFGraphManager
+from core.visualization.visualizer import PAFVisualizer
 from Evaluation.randomization_test_multimode import *
 from Evaluation.perturbation_test_multimode import *
 from Evaluation.utils_main import *
@@ -21,7 +24,9 @@ import warnings
 from Evaluation.pointing_game import evaluate_pointing_game
 from Evaluation.bounding_box_dataset import *
 warnings.filterwarnings("ignore",category=UserWarning,module="captum")
-#device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Automatic device detection based on availability
+device = resolve_device("auto")
 labels=ResNet18_Weights.DEFAULT.meta["categories"]
 
 
@@ -48,7 +53,7 @@ def run_paf(model, model_name,test_samples,paf_modes,debug_level,dataset_name):
     
     idx, x, y, predicted, sample_id = test_samples
     true_label = y.item() if isinstance(y, torch.Tensor) else y
-    hook_manager=PAFHookManager(model)
+    graph_manager=PAFGraphManager(model)
     '''
     for pmode in paf_modes:
         (mode,params)=pmode
@@ -58,11 +63,11 @@ def run_paf(model, model_name,test_samples,paf_modes,debug_level,dataset_name):
     print(f"Label: {labels[y]}")
     paf=PAF(
         model=model,
-        hook_manager=hook_manager,
+        graph_manager=graph_manager,
         debug_level=debug_level,
         x=x,
         target_class=true_label,true_class=true_label,
-        modes       = paf_modes
+        modes=paf_modes
         )
     visualizer = PAFVisualizer(paf, true_class=true_label, target_class=predicted)
     ##visualizer.visualize_layer_results(x, key,save_path="PAF-output/" + model_name + "_" + dataset_name + "_" + mode_name + str(sample_id))
@@ -90,7 +95,7 @@ def run_paf(model, model_name,test_samples,paf_modes,debug_level,dataset_name):
     results = evaluate_pointing_game(
         paf_class          = PAF,
         model              = model,
-        hook_manager       = hook_manager,
+        hook_manager       = graph_manager,
         dataloader         = loader,   # yields (images, labels, boxes)
         device             = device,
         paf_modes          = paf_modes,
@@ -118,7 +123,7 @@ def main():
     args = parser.parse_args()
     '''
 
-    model, hook_manager, test_loader, config_data, device=load_model_dataset()
+    model, graph_manager, test_loader, config_data, device = load_model_dataset()
     
     test_sample=get_test_sample(test_loader, model, device)
     #test_sample=modify_testsample(test_loader.dataset[27026],model,device)
@@ -128,7 +133,7 @@ def main():
     paf_modes = []
     for entry in config_data['paf_modes']: 
         mode=entry['mode'] 
-        mode = getattr(ScoringMode, mode.split('.')[-1])
+        mode = parse_mode_from_string(mode)
         params=entry['params']
         paf_modes.append((mode,params))
 

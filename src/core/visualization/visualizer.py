@@ -1,6 +1,14 @@
-import dis
-import re
 import os
+import re
+from captum.attr import LayerLRP
+
+from core.paf.graph.activations import store
+try:
+    from pytorch_grad_cam import GradCAMPlusPlus
+    HAS_GRADCAM = True
+except ImportError:
+    HAS_GRADCAM = False
+
 from graphviz import Digraph
 import torch
 import torch.fx as fx
@@ -8,22 +16,17 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Union, Dict, List, Optional, Tuple
-import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
 from scipy.ndimage import gaussian_filter
 import cv2
-import matplotlib.gridspec as gridspec
 from matplotlib.patches import ConnectionPatch
 
 #from nn_arch.cnn_mnist import CNN, transform,  device, load_model
-from core.paf import PAF, ScoringMode
-#from core.cnn_analysis import analyze_feature_coalitions
-from core.nn_graph import PAFHookManager, make_model_universal_for_shap
-from captum.attr import IntegratedGradients, LRP, LayerLRP, DeepLiftShap
-from captum.attr import LRP
-from pytorch_grad_cam import GradCAMPlusPlus
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from core.paf.paf import PAF
+from core.paf.scoring import ScoringMode
+from core.paf.graph.manager import PAFGraphManager
+from core.paf.utils import _make_shap_safe, make_mode_key
 
 class PAFVisualizer:
     def __init__(self, paf: PAF,misclassification=False,contrastive_explanation=False,debug_level=0,true_class=0,target_class=0):
@@ -36,6 +39,53 @@ class PAFVisualizer:
         self.true_class=true_class
         self.target_class=target_class
         self.sample_idx=0
+        # Default mode key: prefer explicit distribution key if present
+        try:
+            self.mode_key = next(iter(self.paf.distributions.keys()))
+        except Exception:
+            self.mode_key = None
+
+    # ------------------- Helper utilities -------------------
+    def _resolve_mode_key(self, mode_key: tuple = None) -> tuple:
+        """Return a valid mode_key: provided one, self.mode_key, or first available."""
+        if mode_key is not None:
+            return mode_key
+        if hasattr(self, 'mode_key') and self.mode_key is not None:
+            return self.mode_key
+        # Try to obtain from paf.distributions
+        try:
+            k = next(iter(self.paf.distributions.keys()))
+            self.mode_key = k
+            return k
+        except Exception:
+            raise KeyError("No PAF mode key available; ensure PAF was run before visualizing.")
+
+    def _get_input_node_for_store(self, store: dict) -> str:
+        """Return a sensible input node name present in a PAF store (e.g., 'x' or the last backward node)."""
+        try:
+            return self.paf.graph_manager.graph_info.backward_order[-1]
+        except Exception:
+            pass
+        # otherwise pick any key that looks spatial (has dim>=2)
+        for k, v in store.items():
+            try:
+                if hasattr(v, 'dim') and v.dim() >= 2:
+                    return k
+            except Exception:
+                continue
+        raise KeyError('No suitable input node found in PAF store')
+
+    def _sanitize_filename(self, s: str) -> str:
+        """Create a safe filename fragment from an arbitrary string."""
+        return ''.join(c if c.isalnum() or c in ('-', '_', '.') else '_' for c in s)
+
+    def _normalize_mode_key(self, mode_key):
+        """Convert a (ScoringMode, dict) pair into a hashable mode key."""
+        if mode_key is None:
+            return self._resolve_mode_key(None)
+        if isinstance(mode_key, tuple) and len(mode_key) == 2 and isinstance(mode_key[1], dict):
+            return make_mode_key(mode_key[0], **mode_key[1])
+        return mode_key
 
     def _ensure_save_dir(self, save_path: str) -> None:
         if save_path:
@@ -111,58 +161,51 @@ class PAFVisualizer:
             mode_key:   (ScoringMode, tau) — which scoring mode to use.
                         Defaults to self.mode_key set at construction.
         """
-        # Select mode key
-        key = mode_key if mode_key is not None else self.mode_key
+        # Resolve mode key and store
+        key = self._resolve_mode_key(mode_key)
+        store = self.paf.distributions.get(key, None)
+        if store is None:
+            raise KeyError(f"Mode key {key} not found in paf.distributions")
 
-        # Select distribution store
-        store = self.paf.distributions[key]
-
-        # Get input distribution
+        # Determine input node if not explicitly present
         if input_node not in store:
-            raise KeyError(
-                f"Input node '{input_node}' not found in distributions "
-                f"for mode {key}. "
-                f"Available nodes: {list(store.keys())[:5]}"
-            )
+            input_node = self._get_input_node_for_store(store)
 
         p_in = store[input_node]
 
+        # Determine sample index to use
+        idx = sample_idx if sample_idx is not None else self.sample_idx
+
         # Handle batch dimension
-        if p_in.dim() == 4:
-            p_in = p_in[sample_idx]   # (C, H, W)
-        elif p_in.dim() == 3:
-            p_in = p_in[sample_idx]   # (C, L) for 1D
+        if hasattr(p_in, 'dim') and p_in.dim() == 4:
+            p_in = p_in[idx]   # (C, H, W)
+        elif hasattr(p_in, 'dim') and p_in.dim() == 3:
+            p_in = p_in[idx]
 
         # Aggregate channels — sum gives total mass per spatial position
         heatmap = p_in.sum(dim=0).cpu().numpy()   # (H, W) — may be negative for signed mode
-        is_signed = mode_key[0] == ScoringMode.SIGNED_FULL
+        mode_enum = key[0] if isinstance(key, tuple) else key
+        is_signed = mode_enum == ScoringMode.SIGNED_FULL
+
         if use_mode == 'evaluate':
             # Raw — no post-processing
             self.heatmap = heatmap
             if is_signed:
-                # sign information is irrelevant for pixel ranking
                 return np.abs(heatmap)
             return heatmap
         elif use_mode == 'visualize':
             if is_signed:
-                # Values are tiny and mixed sign — scale to [-1, +1]
-                # using symmetric percentile clipping to avoid outlier dominance
-                v_max = np.percentile(np.abs(heatmap), percentile)
+                v_abs = np.abs(heatmap)
+                v_max = np.percentile(v_abs, percentile)
                 if v_max < 1e-12:
-                    # Completely flat — nothing to show
                     return np.zeros_like(heatmap)
-                heatmap = np.clip(heatmap, -v_max, v_max) / v_max  # → [-1, +1]
-
+                heatmap = np.clip(heatmap, -v_max, v_max) / (v_max + 1e-12)
                 if blur_sigma > 0:
-                    from scipy.ndimage import gaussian_filter
                     heatmap = gaussian_filter(heatmap, sigma=blur_sigma)
             else:
-                # Clip and blur for clean display
-                v_max   = np.percentile(heatmap, percentile)
+                v_max = np.percentile(heatmap, percentile)
                 heatmap = np.clip(heatmap, 0, v_max)
-
                 if blur_sigma > 0:
-                    from scipy.ndimage import gaussian_filter
                     heatmap = gaussian_filter(heatmap, sigma=blur_sigma)
 
             self.heatmap = heatmap
@@ -495,7 +538,8 @@ class PAFVisualizer:
                 # Insert mode info into filename
                 # e.g. "output/branching.png" → "output/branching_abs_tau1.0.png"
                 base, ext = os.path.splitext(save_path)
-                mode_path = f"{base}_{mode_label}{ext}"
+                safe_label = self._sanitize_filename(mode_label.replace('\n', '_'))
+                mode_path = f"{base}_{safe_label}{ext}"
                 os.makedirs(os.path.dirname(mode_path), exist_ok=True)
                 plt.savefig(mode_path, dpi=150, bbox_inches='tight')
                 print(f"Saved: {mode_path}")
@@ -575,9 +619,12 @@ class PAFVisualizer:
             if 'fc' in node_name: return '#e74c3c'
             return '#95a5a6'
 
-        Nodes=self.paf.model.graph_info['traced'].graph.nodes
-        Successors=self.paf.model.graph_info['successors']
-        edge_distributions=self.paf.edge_mass
+        graph_info = self.paf.graph_manager.graph_info
+        Nodes      = graph_info.traced.graph.nodes
+        Successors = graph_info.successors
+        mode_key   = self._resolve_mode_key(None)
+        edge_distributions = self.paf.edge_mass.get(mode_key, {})
+
         # 2. Add Nodes
         for node in Nodes:
             if node.op == 'output': continue
@@ -626,14 +673,24 @@ class PAFVisualizer:
         Uses 99th percentile clipping to avoid outlier dominance.
         mode_key defaults to self.mode_key if not specified.
         """
-        key = mode_key if mode_key is not None else self.mode_key
+        key = self._resolve_mode_key(mode_key)
 
         def _get_clipped_max(distributions_dict: dict) -> float:
-            dist = distributions_dict[key]['x'][self.sample_idx] \
-                .sum(dim=0).cpu().numpy()
-            v_max   = np.percentile(dist, 99)
-            clipped = np.clip(dist, 0, v_max)
-            return clipped.max()
+            store = distributions_dict.get(key, None)
+            if store is None:
+                return 0.0
+            
+            input_node = self.paf.graph_manager.graph_info.backward_order[-1]
+            if input_node not in store:
+                input_node = self._get_input_node_for_store(store)
+
+            dist = store[input_node]
+            if dist.dim() == 4:
+                dist = dist[self.sample_idx]
+            dist_np = dist.sum(dim=0).cpu().numpy()           
+            v_max = np.percentile(dist_np, 99)
+            clipped = np.clip(dist_np, 0, v_max)
+            return float(clipped.max())
 
         curr_max = _get_clipped_max(self.paf.distributions)
 
@@ -644,7 +701,14 @@ class PAFVisualizer:
             return max(curr_max, shared_max)
     
     def get_normalization_factor(self):
-        dist_curr=self.paf.distributions["x"][self.sample_idx].sum(dim=0).cpu().numpy()
+        mode_key    = self._resolve_mode_key(None)
+        input_layer = self.paf.graph_manager.graph_info.backward_order[-1]
+        store       = self.paf.distributions.get(mode_key, {})
+        dist_tensor = store.get(input_layer)
+        if dist_tensor is None:
+            return 1.0
+        dist_curr = dist_tensor[self.sample_idx].sum(dim=0).cpu().numpy()
+ 
         v_max = np.percentile(dist_curr, 99)
         dist_curr_clipped = np.clip(dist_curr, 0, v_max)
 
@@ -652,7 +716,11 @@ class PAFVisualizer:
             return dist_curr_clipped.max()
             #normalization_factor=heatmap.max()
         else: 
-            dist_shared=self.paf_shared.distributions["x"][self.sample_idx].sum(dim=0).cpu().numpy()
+            shared_store   = self.paf_shared.distributions.get(mode_key, {})
+            shared_tensor  = shared_store.get(input_layer)
+            if shared_tensor is None:
+                return dist_curr_clipped.max()
+            dist_shared = shared_tensor[self.sample_idx].sum(dim=0).cpu().numpy()            
             shared_max = np.percentile(dist_shared, 99)
             dist_shared_clipped = np.clip(dist_shared, 0, shared_max)
             normalization_factor= max(dist_curr_clipped.max(),dist_shared_clipped.max())
@@ -1000,7 +1068,7 @@ class PAFVisualizer:
         plt.close()
 
     def plot_paf_branching_logic(self,is_signed=False,save_path: Optional[str] = None):
-        graph = self.paf.model.graph_info
+        graph = self.paf.graph_manager.graph_info
         if is_signed:
             node_masses = self.paf.distributions_signed
             edge_masses = self.paf.edge_mass_signed
@@ -1008,11 +1076,11 @@ class PAFVisualizer:
             node_masses = self.paf.distributions
             edge_masses = self.paf.edge_mass
 
-        node_types = graph['node_types']
-        predecessors = graph.get('predecessors', {})
+        node_types = graph.node_types
+        predecessors = graph.predecessors
         
         # 1. Map successors to find splits
-        successors = graph.get('successors', {})
+        successors = graph.successors
         
         color_map = {
             'conv': '#1f77b4', 'add': '#ff7f0e', 
@@ -1020,7 +1088,7 @@ class PAFVisualizer:
             'fc': '#9467bd', 'input': '#e377c2', 'unknown': '#7f7f7f'
         }
 
-        ordered_nodes = graph['backward_order'][::-1] 
+        ordered_nodes = graph.backward_order[::-1] 
         names, masses, colors = [], [], []
         for node in ordered_nodes:
             if node in node_masses:
@@ -1146,9 +1214,10 @@ class PAFVisualizer:
             plt.show()
         plt.close()
 
-    def show_salient_features(self, x_orig, save_path=None, title="Salient Features (Model Focus)"):
+    def show_salient_features(self, x_orig, mode, save_path=None, title="Salient Features (Model Focus)"):
         sample_idx = 0
-        heatmap_np = self.get_input_heatmap(self.paf.distributions["x"][sample_idx],percentile=99.0, blur_sigma=0) 
+        mode_key = self._normalize_mode_key(mode)
+        heatmap_np = self.get_input_heatmap(self.paf.distributions[mode_key]["x"][sample_idx], percentile=99.0, blur_sigma=0)
         # since heatmap does not normalize, we should normalize here so that everything does not look dark
         mask = torch.from_numpy(heatmap_np).float().unsqueeze(0).unsqueeze(0) # [1, 1, 224, 224]
 
@@ -1203,16 +1272,17 @@ class PAFVisualizer:
             plt.show()
         plt.close()
 
-    def show_clean_contours(self,x_orig, save_path=None, title="Structural Importance Contours (PAF)"):
+    def show_clean_contours(self,x_orig, mode, save_path=None, title="Structural Importance Contours (PAF)"):
         """
         heatmap_np: Your raw PAF heatmap [H, W]
         original_img_np: Your un-normalized RGB image [H, W, 3]
         """
         sample_idx = 0
+        mode_key = self._normalize_mode_key(mode)
         #x_orig = x_orig[sample_idx] if x_orig.dim() == 4 else x_orig
         # 1. Compute Heatmap (using your existing function)
         # We use the raw distribution for 'x' to get the full resolution
-        p_in = self.paf.distributions["x"][sample_idx]
+        p_in = self.paf.distributions[mode_key]["x"][sample_idx]
         heatmap_np = self.get_input_heatmap(p_in,percentile=90.0, blur_sigma=2.0) 
 
         # 2. Normalize smoothed heatmap for consistent thresholding
@@ -1258,15 +1328,16 @@ class PAFVisualizer:
         
         plt.close()
 
-    def plot_salient_contours(self, x_orig, save_path=None, title="Salient Contours (PAF)"):
+    def plot_salient_contours(self, x_orig, mode,save_path=None, title="Salient Contours (PAF)"):
         """
         x_orig: The original input tensor [C, H, W] or [1, C, H, W]
         """
         sample_idx = 0
+        mode_key = self._normalize_mode_key(mode)
         
         # 1. Compute Heatmap (using your existing function)
         # We use the raw distribution for 'x' to get the full resolution
-        p_in = self.paf.distributions["x"][sample_idx]
+        p_in = self.paf.distributions[mode_key]["x"][sample_idx]
         heatmap_np = self.get_input_heatmap(p_in) 
         
         # 2. Generate the Salient Base Image (the 'cutout')
@@ -1469,12 +1540,18 @@ class PAFVisualizer:
         from captum.attr import LayerDeepLiftShap
 
         # Fix: DeepLIFT requires non-inplace ReLUs and unique module instances
-        # Use make_model_universal_for_shap which:
+        # Use _make_shap_safe which:
         #   1. deepcopies the model
         #   2. replaces all ReLU(inplace=True) with ReLU(inplace=False)
         #   3. patches BasicBlock/Bottleneck forward to use unique relu instances
-        shap_model = make_model_universal_for_shap(self.paf.model)
+        device     = input_tensor.device
+        shap_model = _make_shap_safe(self.paf.model)
         shap_model.eval()
+        use_cpu    = device.type == 'mps'
+        run_device = torch.device('cpu') if use_cpu else device
+
+        shap_model  = shap_model.to(run_device)
+        input_run   = input_tensor.to(run_device)
 
         # Find the equivalent target layer in the copied model
         # by matching the module's position in named_modules
@@ -1495,9 +1572,9 @@ class PAFVisualizer:
 
         # Baselines — zeros is standard for DeepSHAP
         baselines = torch.zeros(
-            (n_samples,) + input_tensor.shape[1:],
-            device=input_tensor.device,
-            dtype=input_tensor.dtype,
+            (n_samples,) + input_run.shape[1:],
+            device=run_device,
+            dtype=input_run.dtype,
         )
 
         # Compute attributions on the safe model copy
@@ -1505,7 +1582,7 @@ class PAFVisualizer:
 
         with torch.no_grad():
             attr = ldls.attribute(
-                input_tensor,
+                input_run,
                 baselines   = baselines,
                 target      = target_idx,
                 attribute_to_layer_input = False,   # attribute to layer OUTPUT
@@ -1554,6 +1631,12 @@ class PAFVisualizer:
         heatmap : np.ndarray (H, W) normalised to [0, 1]
         """
         from captum.attr import LayerIntegratedGradients
+        device     = input_tensor.device
+        use_cpu    = device.type == 'mps'
+        run_device = torch.device('cpu') if use_cpu else device
+        model_run  = self.paf.model.to(run_device)
+        input_run  = input_tensor.to(run_device)
+        baseline   = torch.zeros_like(input_run)
 
         # Find layer name in original model
         original_layer_name = None
@@ -1568,16 +1651,18 @@ class PAFVisualizer:
                 f"Pass the module object directly, e.g. model.layer4[1].conv2"
             )
 
-        self.paf.model.eval()
+        model_run.eval()
+
+        target_layer_run = dict(model_run.named_modules())[original_layer_name]
 
         # Baseline — zeros is standard for IG
-        baseline = torch.zeros_like(input_tensor)
+        baseline = torch.zeros_like(input_run)
 
         # LayerIntegratedGradients attributes to layer OUTPUT by default
-        lig = LayerIntegratedGradients(self.paf.model, target_layer)
+        lig = LayerIntegratedGradients(model_run, target_layer_run)
 
         attr = lig.attribute(
-            input_tensor,
+            input_run,
             baselines          = baseline,
             target             = target_idx,
             n_steps            = n_steps,
@@ -1656,7 +1741,7 @@ class PAFVisualizer:
         # ----------------------------------------------------------------
         # Helpers
         # ----------------------------------------------------------------
-        module_map = self.paf.hook_manager.graph_info['module_map']
+        module_map = self.paf.graph_manager.graph_info.module_map
         raw_img    = img[self.sample_idx].cpu().permute(1, 2, 0).numpy()
         raw_img    = (raw_img - raw_img.min()) / \
                     (raw_img.max() - raw_img.min() + 1e-8)
@@ -1687,6 +1772,8 @@ class PAFVisualizer:
 
         def _lrp_layer_heatmap(layer_module):
             try:
+                device = img.device
+                self.paf.model.to(device)
                 llrp = LayerLRP(self.paf.model, layer_module)
                 attr = llrp.attribute(img, target=target)
                 attr = torch.clamp(attr, min=0)
@@ -1829,7 +1916,7 @@ class PAFVisualizer:
 
         # col 0: top-left corner — show input image label
         ax = fig.add_subplot(gs[0, 0])
-        raw_img=img[self.sample_idx].cpu().permute(1, 2, 0).numpy()
+        raw_img=img[self.sample_idx].detach().cpu().permute(1, 2, 0).numpy()
         raw_img = (raw_img - raw_img.min()) / (raw_img.max() - raw_img.min() + 1e-8)
         ax.imshow(raw_img)
         ax.set_title("Input Image", fontsize=12, fontweight='bold')
@@ -2042,7 +2129,7 @@ class PAFVisualizer:
         # ----------------------------------------------------------------
         # Helpers
         # ----------------------------------------------------------------
-        module_map  = self.paf.hook_manager.graph_info['module_map']
+        module_map  = self.paf.graph_manager.graph_info.module_map
         raw_img     = img[self.sample_idx].cpu().permute(1, 2, 0).numpy()
         raw_img     = (raw_img - raw_img.min()) / (raw_img.max() - raw_img.min() + 1e-8)
         H, W        = raw_img.shape[:2]
@@ -2409,7 +2496,7 @@ class PAFVisualizer:
         pivot_layers = [layers[i] for i in indices]
     
         # Map names to actual Module Objects for Captum/GradCAM
-        module_map=self.paf.hook_manager.graph_info['module_map']
+        module_map=self.paf.graph_manager.graph_info.module_map
         pivot_modules = [module_map[name] for name in layers]
 
         fig = plt.figure(figsize=(18, 22))
@@ -2502,7 +2589,7 @@ class PAFVisualizer:
             ax = fig.add_subplot(gs[3, i])
             # Insert your comparison logic here
             #target_layer = get_layer_by_name(self.paf.model, lname)
-            lnode=self.paf.hook_manager.graph_info['module_map'][lname]
+            lnode=self.paf.graph_manager.graph_info.module_map[lname]
             cam = GradCAMPlusPlus(model=self.paf.model, target_layers=[lnode])
             heatmap = cam(input_tensor=img)[0]
             title=lname
@@ -2835,8 +2922,9 @@ class PAFVisualizer:
 
     def visualize_layer_results(self, x,mode,save_path):
         # 1. Get display-ready image
+        mode_key = self._normalize_mode_key(mode)
         img_display = self.get_img_display(x)
-        layers=self.paf.find_layers_with_types(mode=mode,layer_type='conv')  
+        layers=self.paf.find_layers_with_types(mode=mode_key,layer_type='conv')  
         def extract_key(name):
             # 1. Force the very first conv layer to the top
             if name == 'conv1' or name == 'features.0':
@@ -2850,7 +2938,7 @@ class PAFVisualizer:
             return [1] + parts
         layers.sort(key=extract_key)
         for lname in layers:
-            paf_tensor = self.paf.distributions[mode].get(lname)
+            paf_tensor = self.paf.distributions[mode_key].get(lname)
             fig=self.plot_layer_results_combined(img_display, paf_tensor, lname)
             fig.savefig(save_path+f"_{lname}"+".png", dpi=150, bbox_inches="tight", facecolor='white')
             print(f"Layer plot saved to: {save_path}")

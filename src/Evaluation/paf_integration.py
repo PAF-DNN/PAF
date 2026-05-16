@@ -4,15 +4,16 @@ import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter
 from torchvision.models import ResNet18_Weights
-from scipy import stats
-import pandas as pd
-
-from core.paf import *
-from Evaluation.model_factory import ModelConfigLoader, ModelFactory, TrainingConfig
-from core.nn_graph import PAFHookManager
-from core.paf_visualizer import PAFVisualizer
+from Evaluation.utils_main import _paf_mode_key
+from core.paf.paf import PAF
+from core.paf.scoring import ScoringMode
+from core.model.config import ModelConfig, DataConfig
+from core.model.factory import ModelFactory
+from core.paf.graph.manager import PAFGraphManager
+from core.visualization.visualizer import PAFVisualizer
 from Evaluation.randomization_test_multimode import *
 from Evaluation.perturbation_test_multimode import *
+from Evaluation.eval_core.metrics import compute_aggregate_statistics
 import warnings
 
 comparative_analysis=True
@@ -24,15 +25,18 @@ dataset_name="imagenet"
 dataset_path="./data/imagenet-1k"
 yaml_config_path="config/models_config.yaml"
 analyze_misclassification=False   # Set to False to analyze mispredictions instead
-contrastive_interpretation=True
-random_sample=True
-sample_idx=0    
-test_runs=100               # Batch Index of the sample to analyze 
-patch_size=3                 # insertion/deletion, area of insertion deletion
+contrastive_interpretation=False
+random_sample=False
+sample_idx=0
+
+# Automatic device detection based on availability
+from Evaluation.utils_main import resolve_device
+device = resolve_device("auto")    
+test_runs=2               # Batch Index of the sample to analyze 
+patch_size=1                 # insertion/deletion, area of insertion deletion
 test_name="randomization"
 debug_level=0
 analyze_multimode=True      #Temporary
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 labels = ResNet18_Weights.DEFAULT.meta["categories"]
 paf_modes=[
         (ScoringMode.ABS,   {'tau': 1.0}),
@@ -490,7 +494,7 @@ def run_randomization_tests_old(test_loader, model, device):
     rand_test.run(all_samples,labels,"PAF-output/final_scores.png")
 '''
 
-def run_randomization_tests(test_loader, model, device,model_name,hook_manager):
+def run_randomization_tests(test_loader, model, device,model_name,graph_manager):
     all_results = {}  
     method_names = ["PAF", "GCAM", "IG", "LRP","DEEPSHAP"]
     visualize_heatmap=test_runs<5
@@ -506,7 +510,7 @@ def run_randomization_tests(test_loader, model, device,model_name,hook_manager):
         visualize_heatmap=visualize_heatmap,
         paf_modes=paf_modes,
         model_name=model_name,
-        hook_manager=hook_manager
+        graph_manager=graph_manager
         )
     all_samples=[]
     while collected < test_runs:
@@ -516,7 +520,7 @@ def run_randomization_tests(test_loader, model, device,model_name,hook_manager):
         all_samples.append({"idx":idx,"x":x,"y":true_label,"predicted":predicted, "sample_id":sample_id})
         collected += 1
     results=rand_test.run(all_samples,labels,"PAF-output/"+model_name+".png",test_type='both')
-    rand_test.cleanup
+    rand_test.cleanup()
     del rand_test
     del test_sample
     return results
@@ -557,53 +561,49 @@ def get_test_sample(test_loader, model, device,misclassification=False,random_sa
         i = random.randint(0, num_samples - 1) if random_sample else 0
         idx = (i + samples_checked) % num_samples
         x, y = test_set[idx]
-        x=x.unsqueeze(0)
-        x = x.to(device)
+        x=x.unsqueeze(0).to(device)   
         with torch.no_grad():
             logits = model(x)
-        predicted = int(logits.argmax(dim=-1).item())
-        true_label = y.item() if isinstance(y, torch.Tensor) else y
-        is_correct = (predicted == true_label)
-        matches_criteria = (is_correct != misclassification)
-        if matches_criteria:
-            # 3. Successful match: Run hooks and return
-            #hook_manager.run_forward(x)
-            return (idx, x, y,predicted,samples_checked)
+            predicted = int(logits.argmax(dim=-1).item())
+            true_label = y.item() if isinstance(y, torch.Tensor) else y
+            is_correct = (predicted == true_label)
+            matches_criteria = (is_correct != misclassification)
+            if matches_criteria:
+                # 3. Successful match: Run hooks and return
+                return (idx, x, y,predicted,samples_checked)
         samples_checked += 1
     raise RuntimeError("No matching sample found in dataset")
 
     
 def run_purturbation_tests_all_model():
-    loader = ModelConfigLoader("config/models_config.yaml")
-    factory = ModelFactory(loader)
+    from core.model.factory import ModelFactory
+    factory = ModelFactory("config/models_config.yaml")
     #models=['resnet18','resnet34','resnet50','vgg16','vgg19','vit_b_16']
-    models=['resnet18']
+    models=['vit_b_16']
     global_metrics = {}
     steps_shared = None
     for mod_name in models:
         print(f"\n{'='*20}\nEvaluating Model: {mod_name}\n{'='*20}")
-        test_config = TrainingConfig(
-        model=mod_name,  
-        models_config_path=yaml_config_path,
-        num_classes=1000, #for real imagenet, 100 for imagenet-100
-        dataset=dataset_name,    #check the dataset name in models_config.yaml, it should match the one there
-        data_path=dataset_path,
-        #dataset="imagenet",
-        batch_size=1,
-        device=str(device),
-        num_workers=4
+        model_config = ModelConfig(
+            model_name=mod_name,
+            num_classes=1000, #for real imagenet, 100 for imagenet-100
+            pretrained=True,
+            device=str(device),
+            models_config_path=yaml_config_path,
+            dataset=dataset_name
         )
-        model = factory.create_model(
-            model_name=test_config.model,
-            num_classes=test_config.num_classes,
-            pretrained=True
-            ).to(device)
+        data_config = DataConfig(
+            data_path=dataset_path,
+            dataset=dataset_name,
+            batch_size=1,
+            num_workers=4,
+            shuffle=False
+        )
+        model = factory.create_model(model_config).to(device)
         model.eval()
-        hook_manager=PAFHookManager(model)
-        test_loader = factory.get_dataloader(model_name=test_config.model,subset="val", config=test_config)
-        steps, stats, model_results = run_perturbation_tests(test_loader,model,device,test_runs,mod_name,hook_manager)
-        
-        if steps_shared is None: steps_shared = steps
+        graph_manager=PAFGraphManager(model)
+        test_loader = factory.get_dataloader(data_config, model_config)
+        steps, model_results = run_perturbation_tests(test_loader=test_loader, model=model, device=device, n_samples=test_runs, mod_name=mod_name, graph_manager=graph_manager)
 
         for method, res in model_results.items():
             if method not in global_metrics:
@@ -611,21 +611,27 @@ def run_purturbation_tests_all_model():
             
             # Convert list of sample curves to a numpy array for this model
             # res['ins'] is a list of lists (samples x steps)
-            global_metrics[method]['ins'].append(np.array(res['ins']))
-            global_metrics[method]['del'].append(np.array(res['del']))
+            global_metrics[method]['ins'].extend(res['ins'])
+            global_metrics[method]['del'].extend(res['del'])
+
+        if steps_shared is None: steps_shared = steps
+
+    method_names = list(global_metrics.keys())
+    stats, audc, auic, del_matrix, ins_matrix = compute_aggregate_statistics(
+            global_metrics, method_names, steps
+        )
     
-    # Generate the aggregate visualization
-    plot_neurips_aggregate(steps_shared, global_metrics)
-    
-    # Print the numeric data for your LaTeX table
-    #generate_summary_latex_data(steps_shared, global_metrics)
-    generate_summary_table(global_metrics)
+    plot_neurips_aggregate(steps, del_matrix, ins_matrix, audc, auic)
+    generate_summary_table(stats, audc, auic, method_names, output_dir="PAF-output",filename="summary_table.txt")
+
+    #plot_neurips_aggregate(steps_shared, global_metrics)
+    #generate_summary_table(global_metrics)
 
 def run_perturbation_tests(
     test_loader,
     model,
     device,
-    hook_manager,
+    graph_manager,
     n_samples   :int  = 100,
     mod_name  :str=""
 ):
@@ -636,7 +642,7 @@ def run_perturbation_tests(
     perturb_test = PerturbationTestMultiMode(
         model                      = model,
         model_name                 = mod_name,
-        hook_manager               = hook_manager,
+        graph_manager               = graph_manager,
         analyze_misclassification  = analyze_misclassification,
         contrastive_interpretation = contrastive_interpretation,
         sample_idx                 = sample_idx,
@@ -646,7 +652,7 @@ def run_perturbation_tests(
     )
 
     # Build method names dynamically from what PerturbationTest will produce
-    baseline_names = ["GCAM", "IG", "LRP", "DEEPSHAP"]
+    baseline_names = ["GradCAM++", "IG", "LRP", "DeepSHAP"]
     paf_names      = perturb_test.paf_method_names
     method_names   = baseline_names + paf_names
 
@@ -664,7 +670,7 @@ def run_perturbation_tests(
 
         try:
             steps, results = perturb_test.run_perturbation_tests(
-                x, true_label, predicted, device, idx=idx
+                x=x, true_label=true_label, paf_predicted=predicted, device=device, idx=idx
             )
 
             # Accumulate — only store methods that succeeded
@@ -692,6 +698,7 @@ def run_perturbation_tests(
             sample_id += 1
             continue
 
+
     # Filter to methods that have at least one result
     valid_methods = [
         n for n in method_names
@@ -707,8 +714,13 @@ def run_perturbation_tests(
             all_results, valid_methods, steps
         )
 
+    for name, matrix in del_matrix.items():
+        print(f"\n{name}:")
+    for i, curve in enumerate(matrix):
+        print(f"  sample {i}: {np.round(curve[1:-1], 4)}")
+
     # Plot and print
-    perturb_test.plot_aggregated_results(steps, del_matrix, ins_matrix, valid_methods)
+    perturb_test.plot_aggregated_results(steps, del_matrix, ins_matrix, valid_methods,audc,auic)
     perturb_test.print_summary_table(stats, valid_methods,save_path="PAF-output/aggregated_results"+mod_name+".txt")
 
     # Save raw matrices
@@ -716,37 +728,38 @@ def run_perturbation_tests(
     np.save("PAF-output/raw_del.npy", {n: del_matrix[n] for n in valid_methods})
     np.save("PAF-output/raw_ins.npy", {n: ins_matrix[n] for n in valid_methods})
 
-    return steps, stats, all_results
+    return steps, all_results
+
+    #return steps, stats, all_results
 
 def main():
-
     # 1. Initialize Factory and Config
-    loader = ModelConfigLoader("config/models_config.yaml")
-    factory = ModelFactory(loader)
+    from core.model.factory import ModelFactory
+    factory = ModelFactory("config/models_config.yaml")
 
     # data_path contains 'val' and 'train' subdirectories.
-    test_config = TrainingConfig(
-        model=model_name,  
-        models_config_path=yaml_config_path,
-        num_classes=1000, #for real imagenet, 100 for imagenet-100
-        dataset=dataset_name,    #check the dataset name in models_config.yaml, it should match the one there
+    model_config = ModelConfig(
+            model_name=model_name,
+            num_classes=1000,
+            pretrained=True,
+            device=str(device),
+            models_config_path=yaml_config_path,
+            dataset=dataset_name
+        )
+    data_config = DataConfig(
         data_path=dataset_path,
-        #dataset="imagenet",
+        dataset=dataset_name,
         batch_size=1,
-        device=str(device),
-        num_workers=4
+        num_workers=4,
+        shuffle=False
     )
 
     # 2. Setup Model (Pretrained ResNet-18)
-    model = factory.create_model(
-        model_name=test_config.model,
-        num_classes=test_config.num_classes,
-        pretrained=True
-    ).to(device)
+    model = factory.create_model(model_config).to(device)
     model.eval()
 
     # 3. Setup Hooks and Trace Graph
-    #hook_manager = PAFHookManager(model)
+    #graph_manager = PAFGraphManager(model)
     
     # 4. Load ImageNet Val Set using the Factory's new method
     # This automatically applies the 256->224 resize/crop and ImageNet normalization
@@ -760,16 +773,16 @@ def main():
        is_train=False
     )
     '''
-    test_loader = factory.get_dataloader(model_name=test_config.model,subset="val", config=test_config)
+    test_loader = factory.get_dataloader(data_config, model_config)
     #choose_sample_and_generate_visual_interpretation(test_loader, model, device)
     #run_purturbation_tests(test_loader, model, device,test_runs)
     #run_randomization_tests(test_loader, model, device)
     run_multi_score_paf(test_loader, model, device)
-    #run_single_test(hook_manager, test_loader, model, device)
+    #run_single_test(graph_manager, test_loader, model, device)
 
 def run_randomization_tests_all_model():
-    loader = ModelConfigLoader("config/models_config.yaml")
-    factory = ModelFactory(loader)
+    from core.model.factory import ModelFactory
+    factory = ModelFactory("config/models_config.yaml")
     #models=['resnet18','resnet34','resnet50','vgg16','vgg19','vit_b_16']
     models=['vgg16']
     global_metrics = {}
@@ -777,25 +790,26 @@ def run_randomization_tests_all_model():
     results={}
     for mod_name in models:
         print(f"\n{'='*20}\nEvaluating Model: {mod_name}\n{'='*20}")
-        test_config = TrainingConfig(
-            model=mod_name,  
-            models_config_path=yaml_config_path,
+        model_config = ModelConfig(
+            model_name=mod_name,
             num_classes=1000, #for real imagenet, 100 for imagenet-100
-            dataset=dataset_name,    #check the dataset name in models_config.yaml, it should match the one there
-            data_path=dataset_path,
-            batch_size=1,
+            pretrained=True,
             device=str(device),
-            num_workers=4
-            )
-        model = factory.create_model(
-            model_name=test_config.model,
-            num_classes=test_config.num_classes,
-            pretrained=True
-            ).to(device)
+            models_config_path=yaml_config_path,
+            dataset=dataset_name
+        )
+        data_config = DataConfig(
+            data_path=dataset_path,
+            dataset=dataset_name,
+            batch_size=1,
+            num_workers=4,
+            shuffle=False
+        )
+        model = factory.create_model(model_config).to(device)
         model.eval()
-        hook_manager = PAFHookManager(model)
-        test_loader = factory.get_dataloader(model_name=test_config.model,subset="val", config=test_config)
-        results[mod_name]=run_randomization_tests(test_loader,model,device,mod_name,hook_manager)
+        graph_manager = PAFGraphManager(model)
+        test_loader = factory.get_dataloader(data_config, model_config)
+        results[mod_name]=run_randomization_tests(test_loader,model,device,mod_name,graph_manager)
     
         rows = []
         for tt, entries in results[mod_name].items():

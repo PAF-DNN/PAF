@@ -15,7 +15,7 @@ experiment:
 
 # Model Configuration
 model:
-  name: "resnet18" # options: "vit_b_16", "resnet18", "resnet34", "resnet50", "resnet101"
+  name: ["resnet18", "vit_b_16", "resnet50"] # options: "vit_b_16", "resnet18", "resnet34", "resnet50", "resnet101"
   model_config_path: "config/models_config.yaml"
 
 # Dataset Configuration
@@ -25,11 +25,13 @@ dataset:
   random_sample: true
   sample_idx: 0
   batch_size: 1
+  num_classes: 1000
 
 # Benchmarking Parameters
 benchmarking:
-  test_runs: 1
-  patch_size: 3 # area for insertion/deletion tests
+  patch_size: 1 # area for insertion/deletion tests
+  steps: 10 # number of steps for insertion/deletion tests
+  num_samples: 1 # number of samples to evaluate per model 
 
 # PAF Modes
 # Each entry corresponds to (ScoringMode, Parameters)

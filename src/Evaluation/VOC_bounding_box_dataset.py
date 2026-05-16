@@ -157,7 +157,7 @@ def get_voc_pointing_game_loader(
     return DataLoader(
         dataset,
         batch_size  = batch_size,
-        shuffle     = False,
+        shuffle     = True,
         num_workers = num_workers,
         pin_memory  = False,
         collate_fn  = _collate_boxes,

@@ -7,6 +7,25 @@ name = "paf"
 version = "0.1.0"
 description = "Probabilistic Activation Flow experiments and evaluation utilities."
 requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "torchvision",
+    "captum",
+    "grad-cam",
+    "datasets",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-image",
+    "seaborn",
+    "opencv-python",
+    "Pillow",
+    "PyYAML",
+    "tqdm",
+    "memory-profiler",
+    "graphviz",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

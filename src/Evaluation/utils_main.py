@@ -1,3 +1,6 @@
+import sys
+import os
+import cv2
 import torch
 import random
 import matplotlib.pyplot as plt
@@ -6,29 +9,31 @@ from scipy.ndimage import gaussian_filter
 from torchvision.models import ResNet18_Weights
 from scipy import stats
 import pandas as pd
-from core.paf import *
-from Evaluation.model_factory import ModelConfigLoader, ModelFactory, TrainingConfig
-from core.nn_graph import PAFHookManager
-from core.paf_visualizer import PAFVisualizer
-from Evaluation.randomization_test_multimode import *
-from Evaluation.perturbation_test_multimode import *
+from core.paf.paf import PAF
+from core.paf.scoring import ScoringMode
+from core.paf.utils import make_mode_key
+from core.model.config import ModelConfig, DataConfig
+from core.model.factory import ModelFactory
+from core.paf.graph.manager import PAFGraphManager
+from core.visualization.visualizer import PAFVisualizer
+#from Evaluation.randomization_test_multimode import *
+#from Evaluation.perturbation_test_multimode import *
 import yaml
+from pathlib import Path
+
+# Project root = two levels up from this file (src/Evaluation/utils_main.py)
+#_PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 def load_config(config_path):
-    with open(config_path, 'r') as file:
+ #   full_path = _PROJECT_ROOT / config_path
+    full_path = Path(config_path)
+    with open(full_path, 'r') as file:
         return yaml.safe_load(file)
 
-@staticmethod
 def _paf_mode_key(mode) -> str:
         (mode, kwargs)=mode
-        t   = kwargs.get('tau', 1.0)
-        if mode == ScoringMode.SIGNED_SPLIT:
-            alpha = kwargs.get('alpha', 1.0)
-            beta  = kwargs.get('beta',  0.0)
-            key = (mode, t, alpha, beta)   # unique key per alpha/beta combination
-        else:
-            key = (mode, t)   
-        return key # unicode \u03C4
+        from core.paf.utils import make_mode_key
+        return str(make_mode_key(mode, **kwargs))
 
 def resolve_device(device_config: str = "auto") -> torch.device:
     if not isinstance(device_config, str):
@@ -62,44 +67,73 @@ def resolve_device(device_config: str = "auto") -> torch.device:
 
 
 def load_model_dataset():
-
-    config_data=load_config("config/evaluation_config.yaml")
+    config_data = load_config("config/evaluation_config.yaml")
     model_name = config_data['model']['name']
-    model_config_path=config_data['model']['model_config_path']
     dataset_name = config_data['dataset']['name']
-    dataset_path= config_data['dataset']['path']
+    dataset_path = config_data['dataset']['path']
     experiment_config = config_data.get('experiment', {})
-    shuffle=experiment_config.get('random_sample', False)
+    shuffle = experiment_config.get('random_sample', False)
     batch_size = config_data['dataset']['batch_size']
-    device= resolve_device(experiment_config.get('device', 'auto'))
-    # 1. Initialize Factory and Config
-    loader = ModelConfigLoader("config/models_config.yaml")
-    factory = ModelFactory(loader)
-    # data_path contains 'val' and 'train' subdirectories.
-    test_config = TrainingConfig(
-        model=model_name,  
-        models_config_path=model_config_path,
-        num_classes=1000,       #for real imagenet, 100 for imagenet-100
-        dataset=dataset_name,    #check the dataset name in models_config.yaml, it should match the one there
-        data_path=dataset_path,
-        #dataset="imagenet",
-        batch_size=batch_size,
+    device = resolve_device(experiment_config.get('device', 'auto'))
+    
+    # Create clean configurations
+    model_cfg = ModelConfig(
+        model_name=model_name,
+        num_classes=1000,
+        pretrained=True,
         device=str(device),
-        num_workers=4,
+        dataset=dataset_name
+    )
+    
+    data_cfg = DataConfig(
+        data_path=dataset_path,
+        dataset=dataset_name,
+        batch_size=batch_size,
         shuffle=shuffle
     )
-
-    # 2. Setup Model (Pretrained ResNet-18)
-    model = factory.create_model(
-        model_name=test_config.model,
-        num_classes=test_config.num_classes,
-        pretrained=True
-    ).to(device)
-    model.eval()
-    hook_manager = PAFHookManager(model)
+    
+    # Create model and dataloader
+    factory = ModelFactory()
+    model = factory.create_model(model_cfg)
+    graph_manager = PAFGraphManager(model)
+    
     print("Loading Validation samples...")
-    test_loader = factory.get_dataloader(model_name=test_config.model,subset="val", config=test_config)
-    return model, hook_manager, test_loader, config_data, device
+    test_loader = factory.get_dataloader(data_cfg, model_cfg)
+    
+    return model, graph_manager, test_loader, config_data, device
+
+# ----------------------------------------------------------------  
+# Sample selection and utilities
+# ----------------------------------------------------------------
+def get_sample_image(
+    test_loader,
+    model,
+    device,
+    misclassification: bool = False,
+    random_sample:     bool = False,
+    samples_checked:   int  = 0,
+):
+    dataset    = test_loader.dataset
+    n          = len(dataset)
+
+    for offset in range(n):
+        idx = (
+            random.randint(0, n - 1)          # random — ignore position
+            if random_sample else
+            (samples_checked + offset) % n    # sequential — resume from last
+        )
+        x, y       = dataset[idx]
+        x          = x.unsqueeze(0).to(device)
+        true_label = y.item() if isinstance(y, torch.Tensor) else int(y)
+
+        with torch.no_grad():
+            predicted = int(model(x).argmax(dim=-1).item())
+
+        if (predicted == true_label) != misclassification:
+            next_checked = samples_checked + offset + 1  # only needed for sequential
+            return idx, x, y, predicted, next_checked
+
+    raise RuntimeError("No matching sample found in dataset")
 
 def modify_testsample(testset,model,device):
     x, y = testset
@@ -131,7 +165,7 @@ def get_test_sample(test_loader, model, device,misclassification=False,random_sa
         matches_criteria = (is_correct != misclassification)
         if matches_criteria:
             # 3. Successful match: Run hooks and return
-            #hook_manager.run_forward(x)
+            #graph_manager.run_forward(x)
             return (idx, x, y,predicted,samples_checked)
         samples_checked += 1
     raise RuntimeError("No matching sample found in dataset")

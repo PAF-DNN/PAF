@@ -1,24 +1,30 @@
+import glob
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 import numpy as np
 import matplotlib.pyplot as plt
-from skimage.metrics import structural_similarity as ssim
-import copy
-import os
 import cv2
 from captum.attr import DeepLiftShap, IntegratedGradients
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.stats import spearmanr
 import pandas as pd
 import seaborn as sns
+import copy
+import os
 import tracemalloc
 import time
 
-from Evaluation.xai_integration import *
-from core.paf import *
-from core.paf_visualizer import PAFVisualizer
+from Evaluation.utils_main import get_sample_image
+from Evaluation.xai_integration import XAI
+from core.visualization.visualizer import PAFVisualizer
+from core.paf.scoring import ScoringMode
+from Evaluation.eval_core.paf_runner import PAFRunner
+from Evaluation.eval_core.baseline_runner import BaselineRunner
+from Evaluation.eval_core.metrics import compute_similarity_scores, spearman_correlation, ssim_score
+from torchvision.models import ResNet18_Weights
 
 
 class RandomizationTestMultiMode:
@@ -26,7 +32,7 @@ class RandomizationTestMultiMode:
         self,
         model,
         device,
-        hook_manager,
+        graph_manager,
         analyze_misclassification=False,
         contrastive_interpretation=False,
         sample_idx=0,
@@ -46,19 +52,17 @@ class RandomizationTestMultiMode:
         self.stages = ["original", "last_conv", "full"]
         self.stage_titles = ["Trained", "Random-last conv", "Random-Full"]
         self.model_name=model_name
-        self.hook_manager=hook_manager
+        self.graph_manager=graph_manager
         # PAF scoring modes — default to ABS only for backward compatibility
         if paf_modes is None:
             self.paf_modes = [(ScoringMode.ABS, {'tau': 1.0})]
         else:
             self.paf_modes = paf_modes
 
-        # Build PAF method names for each mode
-        # e.g. 'PAF_abs_1.0', 'PAF_power_2.0'
-        self.paf_method_names = [
-            self._paf_mode_name(mode, kwargs)
-            for mode, kwargs in self.paf_modes
-        ]
+        # Initialize core runners
+        self._paf_runner = PAFRunner(model, graph_manager, paf_modes)
+       
+        
 
     def cleanup(self):
         if hasattr(self, 'xai') and self.xai is not None:
@@ -77,15 +81,6 @@ class RandomizationTestMultiMode:
                     module._forward_pre_hooks.clear()
 
         torch.cuda.empty_cache()     
-
-    @staticmethod
-    def _paf_mode_name(mode: ScoringMode, kwargs: dict) -> str:
-        """Human-readable name for a PAF mode."""
-        tau = kwargs.get('tau', 1.0)
-        return f"PAF-{mode.value} τ={tau}"
-    
-
-    
 
     # ------------------------------------------------------------------
     # Weight randomisation
@@ -235,8 +230,8 @@ class RandomizationTestMultiMode:
             h_original = stage_results['original'].get(name)
             for stage in [s for s in self.stages if s != "original"]:
                 h_perturbed = stage_results[stage].get(name)
-                spear    = self.spearman_correlation(h_original, h_perturbed)
-                ssim_val = self.ssim_score(h_original, h_perturbed)
+                spear    = spearman_correlation(h_original, h_perturbed)
+                ssim_val = ssim_score(h_original, h_perturbed)
                 comparison_scores[name][stage] = {
                     'spearman': spear,
                     'ssim':     ssim_val,
@@ -263,105 +258,66 @@ class RandomizationTestMultiMode:
         results = {}
         memory_dict={}
         time_dict={}
-        # --- Baseline methods ---
-        baselines = ['IG', 'GradCAM', 'DeepSHAP', 'LRP']
-        for method_name in baselines:
-            try:
-                tracemalloc.start()
-                start_time = time.perf_counter()
+        H, W = input_x.shape[-2], input_x.shape[-1]
+        
 
-                if method_name == 'IG':
-                    results['IG'] = self.xai.get_integrated_gradient_map(input_x, target_y)
-                elif method_name == 'GradCAM':
-                    results['GradCAM'] = self.xai.get_gradcam_map(input_x, target_y)
-                elif method_name == 'DeepSHAP':
-                    results['DeepSHAP'] = self.xai.get_deepshap_heatmap(input_x, target_y)
-                elif method_name == 'LRP':
-                    results['LRP'] = self.xai.get_lrp_map(input_x, target_y)
+        # ── Update graph_manager to use current model (randomised or original) ──
+        self.graph_manager._model = model
+        self.graph_manager._activation_store._interpreter.module = \
+            self.graph_manager._graph_info.traced
+        # Update traced graph weights to match current model
+        self.graph_manager._graph_info.traced.load_state_dict(
+            model.state_dict(), strict=False
+        )
+        paf_runner      = PAFRunner(model, self.graph_manager, self.paf_modes)
+        paf_method_names = paf_runner.mode_names(self.paf_modes)
+        
+        baseline_runner = BaselineRunner(model, None)
 
-                # Record metrics
-                end_time = time.perf_counter()
-                current, peak = tracemalloc.get_traced_memory()
-                tracemalloc.stop()
-                duration = end_time - start_time
-                peak_mb = peak / (1024 * 1024)
+        # --- Baseline methods using core runner ---
+        tracemalloc.start()
+        start_time = time.perf_counter()
+        baseline_results = baseline_runner.run(input_x, target_y, H, W)
+        end_time = time.perf_counter()
+        current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        duration = end_time - start_time
+        peak_mb = peak / (1024 * 1024)
+        
+        for method_name, heatmap in baseline_results.items():
+            results[method_name] = heatmap
+            time_dict[method_name] = duration
+            memory_dict[method_name] = peak_mb
+            print("Method: {}, Time: {:.3f}, Memory: {:.3f}".format(method_name, duration, peak_mb))
 
+        # --- PAF — all modes in one forward pass using core runner ---
+        try:
+            tracemalloc.start()
+            start_time = time.perf_counter()
+            
+            paf_heatmaps = paf_runner.get_heatmaps(
+                input_x, target_y, 'conv1', H, W, target_y
+            )
+            
+            end_time = time.perf_counter()
+            current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            duration = end_time - start_time
+            peak_mb = peak / (1024 * 1024)
+            
+            # Add PAF results with timing/memory info
+            for method_name, heatmap in paf_heatmaps.items():
+                results[method_name] = heatmap
                 time_dict[method_name] = duration
                 memory_dict[method_name] = peak_mb
                 print("Method: {}, Time: {:.3f}, Memory: {:.3f}".format(method_name, duration, peak_mb))
-
-            except Exception as e:
-                print(f"{method_name} failed: {e}")
-                results[method_name] = None
-
-        # --- PAF — all modes in one forward pass ---
-        try:
-            mode_dict={}
-            method_dict={}
-            all_modes=[]
-            for (mode, kwargs), method_name in zip(
-                self.paf_modes, self.paf_method_names
-            ):
-                mode_dict[mode] = (mode, kwargs.get('tau', 1.0))
-                method_dict[mode] = method_name
-                all_modes.append(mode)
-
-            for (mode,kwargs) in self.paf_modes:
-                tracemalloc.start()
-                start_time = time.perf_counter()
-
-                paf = PAF(
-                    model        = model,
-                    hook_manager = self.hook_manager,
-                    x            = input_x,
-                    target_class = target_y,
-                    true_class   = target_y,
-                    output_mode  = "target",
-                    modes        = [(mode,kwargs)],
-                )
-                paf_visualizer = PAFVisualizer(
-                    paf,
-                    misclassification       = self.analyze_misclassification,
-                    contrastive_explanation = self.contrastive_explanation,
-                    true_class              = target_y,
-                    target_class            = paf_predicted,
-                )           
-
-            #for (mode, kwargs), method_name in zip(
-            #    self.paf_modes, self.paf_method_names
-            #):
-                #mode_key = (mode, kwargs.get('tau', 1.0))
-                mode_key=mode_dict[mode]
-                method_name=method_dict[mode]
-                try:
-                    heatmap = paf_visualizer.get_heatmap_per_mode(
-                        mode_key   = mode_key,
-                        sample_idx = self.sample_idx,
-                        use_mode       = 'evaluate',   # raw — no post-processing
-                    )
-                    results[method_name] = heatmap
-                except Exception as e:
-                    print(f"PAF heatmap failed for {method_name}: {e}")
-                    results[method_name] = None
-
-                paf_visualizer = None
-                paf.cleanup()
-                del paf
-                del paf_visualizer
-
-                end_time = time.perf_counter()
-                current, peak = tracemalloc.get_traced_memory()
-                tracemalloc.stop()
-                duration = end_time - start_time
-                peak_mb = peak / (1024 * 1024)
-                memory_dict['PAF'] = peak_mb
-                time_dict['PAF'] = duration
-                print("PAF-{} Time: {:.3f}, Memory: {:.3f} ".format(method_name, duration, peak_mb))
-
+                
         except Exception as e:
             print(f"PAF failed: {e}")
-            for method_name in self.paf_method_names:
+            for method_name in paf_method_names:
                 results[method_name] = None
+        finally:
+            paf_runner.cleanup()
 
         return results, time_dict, memory_dict
 
@@ -494,8 +450,8 @@ class RandomizationTestMultiMode:
             h_original = stage_results['original'].get(name)
             for stage in [s for s in self.stages if s != 'original']:
                 h_perturbed = stage_results[stage].get(name)
-                spear    = self.spearman_correlation(h_original, h_perturbed)
-                ssim_val = self.ssim_score(h_original, h_perturbed)
+                spear    = spearman_correlation(h_original, h_perturbed)
+                ssim_val = ssim_score(h_original, h_perturbed)
                 comparison_scores[name][stage] = {
                     'spearman': spear,
                     'ssim':     ssim_val,
@@ -542,7 +498,7 @@ class RandomizationTestMultiMode:
 
                 for tt in test_types:
                     scores = self.run_single(
-                        x, y, device, predicted, sample_id,
+                        x, y, self.device, predicted, sample_id,
                         test_type=tt
                     )
                     counter_tt = counter  # same sample, different test
@@ -754,27 +710,7 @@ class RandomizationTestMultiMode:
     # Similarity metrics
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def spearman_correlation(h1, h2):
-        if h1 is None or h2 is None:
-            return None
-        h1_flat = h1.flatten()
-        h2_flat = h2.flatten()
-        if h1_flat.shape != h2_flat.shape:
-            h2_flat = cv2.resize(h2, h1.shape[::-1]).flatten()
-        corr, _ = spearmanr(h1_flat, h2_flat)
-        return corr
-
-    @staticmethod
-    def ssim_score(h1, h2):
-        if h1 is None or h2 is None:
-            return None
-        if h1.shape != h2.shape:
-            h2 = cv2.resize(h2, (h1.shape[1], h1.shape[0]))
-        h1_norm = (h1 - h1.min()) / (h1.max() - h1.min() + 1e-8)
-        h2_norm = (h2 - h2.min()) / (h2.max() - h2.min() + 1e-8)
-        return ssim(h1_norm, h2_norm, data_range=1.0)
-
+    
     # ------------------------------------------------------------------
     # Visualisation
     # ------------------------------------------------------------------
@@ -892,3 +828,103 @@ class RandomizationTestMultiMode:
                 textcoords = "offset points",
                 ha='center', va='bottom', fontsize=7, rotation=45
             )
+
+
+def run_randomization_tests(
+        test_loader, 
+        model, 
+        model_name,
+        device,
+        n_samples,
+        graph_manager,
+        paf_modes,
+        output_dir="PAF-output",
+        random_sample:bool = True
+):
+    all_results = {}  
+    method_names = ["PAF", "GCAM", "IG", "LRP","DEEPSHAP"]
+    collected = 0
+    sample_id=0
+    rand_test=RandomizationTestMultiMode(
+        model=model,
+        device=device,
+        paf_modes=paf_modes,
+        model_name=model_name,
+        graph_manager=graph_manager
+        )
+    all_samples=[]
+    while collected < n_samples:
+        test_sample = get_sample_image(
+            test_loader, model, device,
+            random_sample,
+            samples_checked=sample_id
+        )
+        idx, x, y, predicted, sample_id = test_sample
+        true_label = y.item() if isinstance(y, torch.Tensor) else y
+        all_samples.append({"idx":idx,"x":x,"y":true_label,"predicted":predicted, "sample_id":sample_id})
+        collected += 1
+
+    labels = ResNet18_Weights.DEFAULT.meta["categories"]
+    results=rand_test.run(all_samples,labels,output_dir+"/"+model_name+".png",test_type='both')
+    rand_test.cleanup()
+    del rand_test
+    del test_sample
+    return results
+
+def load_and_plot_all(output_dir):
+    # 1. Gather all CSV files in the checkpoint directory
+    path = output_dir
+    all_files = glob.glob(os.path.join(path, "*.csv"))
+
+    if not all_files:
+        print("No results found!")
+        return
+
+    # 2. Combine them into one big DataFrame
+    df_list = [pd.read_csv(f) for f in all_files]
+    final_df = pd.concat(df_list, ignore_index=True)
+    
+    print(f"Loaded results for {final_df['model_name'].nunique()} models.")
+    
+    # 3. Save the final master file for the paper
+    final_df.to_csv("final_randomization_results_master.csv", index=False)
+    
+    return final_df
+
+def plot_specific_randomization(df, test_type="weight"):
+    # Filter for the specific test
+    sub_df = df[df['test_type'] == test_type]
+    
+    # Melt to handle Spearman and SSIM as sub-plots
+    df_melted = sub_df.melt(
+        id_vars=['method', 'stage'], 
+        value_vars=['spearman', 'ssim'], 
+        var_name='metric', value_name='similarity'
+    )
+
+    sns.set_theme(style="whitegrid", font="serif")
+    
+    # Create a 1x2 grid (Spearman on left, SSIM on right)
+    g = sns.FacetGrid(
+        df_melted, col='metric', hue='stage', 
+        height=5, aspect=1.2, sharey=True,
+        palette={'last_conv': '#66c2a5', 'full': '#fc8d62'}
+    )
+
+    g.map_dataframe(
+        sns.boxplot, x='method', y='similarity', 
+        showmeans=True, meanprops={"marker":"o", "markerfacecolor":"white"}
+    )
+
+    # Styling
+    title_suffix = "Weight (Parametric)" if test_type == "weight" else "Activation (Data)"
+    g.figure.suptitle(f"Sanity Check: {title_suffix}", fontweight='bold', y=1.05)
+    
+    for ax in g.axes.flat:
+        ax.axhline(0.3, ls='--', color='red', alpha=0.6, label='Threshold')
+        plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+
+    g.add_legend()
+    plt.savefig(f"PAF-output/{test_type}_randomization_final_results.pdf", bbox_inches='tight')
+    plt.show()
+

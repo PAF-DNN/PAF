@@ -21,33 +21,20 @@ Dataset requirement:
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import cv2
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 from tqdm import tqdm
-from pytorch_grad_cam import GradCAMPlusPlus
-from captum.attr import LayerLRP, LayerIntegratedGradients, LayerDeepLiftShap
 from Evaluation.bounding_box_dataset import *
+from Evaluation.eval_core.metrics import pointing_game_single, paf_box_evaluation
+from Evaluation.eval_core.paf_runner import PAFRunner
+from Evaluation.eval_core.baseline_runner import BaselineRunner
+from Evaluation.eval_core.heatmap_utils import _paf_to_numpy_hw, _to_numpy_hw
 
 # ============================================================================
-# Core metric
+# Core metric - now imported from Evaluation.core.metrics
 # ============================================================================
-
-def pointing_game_single(
-    heatmap: np.ndarray,            # (H, W) float, any scale
-    box:     Tuple[int,int,int,int],# (x1, y1, x2, y2) pixel coords
-) -> bool:
-    """
-    Returns True if the heatmap peak falls inside the bounding box.
-    Returns False if the heatmap is all-zero (degenerate case).
-    """
-    if heatmap.max() <= 0:
-        return False
-    peak_y, peak_x = np.unravel_index(heatmap.argmax(), heatmap.shape)
-    x1, y1, x2, y2 = box
-    return (x1 <= peak_x <= x2) and (y1 <= peak_y <= y2)
 
 
 def pointing_game_batch(
@@ -74,100 +61,10 @@ def pointing_game_batch(
 
 
 # ============================================================================
-# Heatmap extraction utilities
+# Heatmap extraction utilities - now imported from Evaluation.core.heatmap_utils
 # ============================================================================
-def _paf_to_numpy_hw(
-    p:    torch.Tensor,    # PAF distribution — any shape
-    H:    int,
-    W:    int,
-) -> np.ndarray:
-    """
-    Convert PAF distribution to (H,W) numpy array.
-
-    Rules:
-    - Take MAX over channels (not sum) — preserves peak location
-    - Use nearest or bilinear interpolation (not bicubic) — no ringing
-    - Normalise to sum=1 — preserves probability interpretation for MiB
-    - Never clip to [0,1] via max — preserves relative magnitudes
-    """
-    t = p.detach().cpu().float()
-
-    # Remove batch dim
-    if t.dim() == 4:
-        t = t[0]                              # (C, h, w)
-
-    if t.dim() == 3:
-        # Take max over channels — preserves the strongest spatial signal
-        # Sum diffuses peaks across channels with different spatial patterns
-        t = t.abs().amax(dim=0)              # (h, w)
-    elif t.dim() == 2:
-        t = t.abs()                          # already (h, w)
-    elif t.dim() == 1:
-        return np.zeros((H, W))             # flat — no spatial info
-
-    # t is now (h, w)
-    h, w = t.shape
-    if h != H or w != W:
-        t = F.interpolate(
-            t.unsqueeze(0).unsqueeze(0),     # (1, 1, h, w)
-            size    = (H, W),
-            mode    = 'bilinear',            # bilinear — no ringing
-            align_corners = False,
-        ).squeeze()                          # (H, W)
-
-    arr = t.numpy().astype(np.float32)
-    arr = np.clip(arr, 0, None)             # PAF is non-negative by design
-
-    # Normalise to sum=1 — preserves probability interpretation
-    # Do NOT divide by max — that destroys MiB
-    s = arr.sum()
-    if s > 0:
-        arr = arr / s
-
-    return arr
 
 
-def _to_numpy_hw(
-    attr: torch.Tensor,    # captum attribution — can be signed
-    H:    int,
-    W:    int,
-) -> np.ndarray:
-    """
-    Convert baseline attribution (GradCAM, LRP, IG, DeepSHAP) to (H,W).
-
-    Rules:
-    - Sum over channels after abs — standard for gradient methods
-    - Bilinear interpolation
-    - Normalise to [0,1] via max — standard for pointing game
-    """
-    t = attr.detach().cpu().float()
-
-    if t.dim() == 4:
-        t = t[0]                             # (C, h, w)
-    if t.dim() == 3:
-        t = t.abs().sum(dim=0)              # (h, w) — sum ok for gradients
-    elif t.dim() == 2:
-        t = t.abs()
-    elif t.dim() == 1:
-        return np.zeros((H, W))
-
-    h, w = t.shape
-    if h != H or w != W:
-        t = F.interpolate(
-            t.unsqueeze(0).unsqueeze(0),
-            size          = (H, W),
-            mode          = 'bilinear',
-            align_corners = False,
-        ).squeeze()
-
-    arr = t.numpy().astype(np.float32)
-    arr = np.clip(arr, 0, None)
-
-    # Normalise to [0,1] for pointing game peak detection
-    if arr.max() > 0:
-        arr = arr / arr.max()
-
-    return arr
 
 def _paf_input_heatmap(
     distributions: Dict,
@@ -185,6 +82,7 @@ def _paf_input_heatmap(
         return np.zeros((H, W))
     return _to_numpy_hw(p[sample_idx] if p.dim() == 4 else p, H, W)
 
+'''
 def paf_box_evaluation(
     heatmap:   np.ndarray,          # (H, W) — PAF distribution, sums to 1
     box:       Tuple[int,int,int,int],
@@ -223,11 +121,12 @@ def paf_box_evaluation(
         result[f'hit_{int(t*100)}'] = bool(mass_in_box >= t)
 
     return result
+    
 
 def evaluate_paf_box_mass(
     paf_class,
     model,
-    hook_manager,
+    graph_manager,
     dataloader,
     device,
     paf_modes,
@@ -250,7 +149,7 @@ def evaluate_paf_box_mass(
     }
     total       = defaultdict(int)
 
-    input_layer = hook_manager.graph_info['backward_order'][-1]
+    input_layer = graph_manager.graph_info['backward_order'][-1]
     n_processed = 0
 
     for batch in tqdm(dataloader, desc='Box Mass Evaluation'):
@@ -270,7 +169,7 @@ def evaluate_paf_box_mass(
             label = labels[si].item()
             box   = tuple(boxes[si].cpu().numpy().astype(int))
 
-            #hook_manager.run_forward(x)
+            #graph_manager.run_forward(x)
 
             try:
                 paf_instance  = paf_class(
@@ -357,6 +256,7 @@ def evaluate_paf_box_mass(
     print(f"      PG = standard pointing game (peak pixel inside box).")
 
     return results
+    
 
 def preprocess_heatmap_for_evaluation(
     heatmap:    np.ndarray,    # (H, W) raw PAF distribution
@@ -395,6 +295,7 @@ def preprocess_heatmap_for_evaluation(
         h = h / h.sum()   # re-normalise to sum=1
 
     return h
+    '''
 
 def debug_box_alignment(
     heatmap:   np.ndarray,    # (H, W) float, sum=1
@@ -538,11 +439,11 @@ def debug_box_alignment(
 def evaluate_pointing_game(
     paf_class,
     model:        nn.Module,
-    hook_manager,
+    graph_manager,
     dataloader,
     device:       torch.device,
     paf_modes:    List[tuple],
-    target_layer_name: str = 'features_28', #'layer4_1_conv2',
+    target_layer_name: str = None,
     num_samples:  Optional[int] = None,
     use_baselines: bool = True,
     thresholds:   List[float] = [0.5, 0.6, 0.7],
@@ -550,23 +451,39 @@ def evaluate_pointing_game(
 ) -> Dict[str, Dict]:
 
     model.eval()
-
-    # Accumulators
     hits        = defaultdict(int)
     total       = defaultdict(int)
-    mass_scores = defaultdict(list)   # PAF only — continuous [0,1]
+    mass_scores = defaultdict(list)
     th_hits     = {t: defaultdict(int) for t in thresholds}
+    module_map   = graph_manager.graph_info.module_map
+    #target_layer = module_map.get(target_layer_name)
+    input_layer  = graph_manager.graph_info.backward_order[-1]
 
-    module_map   = hook_manager.graph_info['module_map']
-    target_layer = module_map.get(target_layer_name)
-    input_layer  = hook_manager.graph_info['backward_order'][-1]
-    PAF_EVAL_LAYER = 'conv1' 
-    if target_layer is None and use_baselines:
-        raise ValueError(
-            f"target_layer_name '{target_layer_name}' not found. "
-            f"Available: {list(module_map.keys())[:10]}"
-        )
+    # Only resolve target_layer if baselines are requested
+    target_layer = None
+    if use_baselines:
+        if target_layer_name is None:
+            # Auto-detect last conv layer
+            target_layer = next(
+                (m for m in reversed(list(module_map.values()))
+                 if isinstance(m, nn.Conv2d)),
+                None
+            )
+            if target_layer is None:
+                print("WARNING: No Conv2d found — disabling baselines")
+                use_baselines = False
+        else:
+            target_layer = module_map.get(target_layer_name)
+            if target_layer is None:
+                print(
+                    f"WARNING: target_layer_name '{target_layer_name}' not found. "
+                    f"Available: {list(module_map.keys())[:10]}\n"
+                    f"Disabling baselines — PAF will still run."
+                )
+                use_baselines = False
 
+    baseline_runner = BaselineRunner(model, target_layer) if use_baselines else None
+    paf_runner = PAFRunner(model, graph_manager, paf_modes)
     n_processed = 0
 
     for batch_idx, batch in enumerate(tqdm(dataloader,
@@ -579,8 +496,6 @@ def evaluate_pointing_game(
         labels = labels.to(device)
         B, C, H, W = images.shape
 
-        
-
         if isinstance(boxes, torch.Tensor):
             boxes = boxes.cpu().numpy().astype(int)
 
@@ -592,121 +507,26 @@ def evaluate_pointing_game(
             label = labels[si].item()
             box   = tuple(boxes[si])
 
-            #hook_manager.run_forward(x)
-
             # --------------------------------------------------------
             # PAF
             # --------------------------------------------------------
             try:
-                paf_instance  = paf_class(
-                    model        = model,
-                    hook_manager = hook_manager,
-                    modes        = paf_modes,
-                    x            = x,
-                    target_class = label,
-                    true_class   = label,
+                heatmaps = paf_runner.get_heatmaps(
+                    x, label, input_layer, H, W, true_class=label
                 )
-                distributions = paf_instance.distributions
             except Exception as e:
-                        print(f"PAF failed at sample {n_processed}: {e}")
-                        n_processed += 1
-                        continue
+                print(f"PAF failed at sample {n_processed}: {e}")
+                n_processed += 1
+                continue
 
-            for mode_key in distributions:
-                mode_name = _mode_key_to_str(mode_key)
-                store     = distributions[mode_key]
-                p         = store.get(input_layer)
-
-                if p is None:
+            for mode_name, heatmap in heatmaps.items():
+                if heatmap is None:
                     continue
 
-                
-                heatmap = _to_numpy_hw(
-                    p[0] if p.dim() == 4 else p, H, W
-                )
-
-                '''
-                mean = np.array([0.485, 0.456, 0.406])
-                std  = np.array([0.229, 0.224, 0.225])
-                raw  = x[0].permute(1,2,0).numpy()   # (H, W, 3)
-                raw  = np.clip(raw * std + mean, 0, 1)    # denormalise
-
-                #hmap=p.squeeze(0).sum(dim=1)
-                #debug_box_alignment(heatmap,raw,box,mode_name,"PAF-output/debug"+mode_name+".png")
-                
-                import matplotlib.pyplot as plt
-                import matplotlib.patches as patches
-                from PIL import Image
-
-                dataset = dataloader.dataset
-
-                # Check box on TRANSFORMED image (not original)
-                img_path, stem, class_idx = dataset.samples[0]
-                img       = Image.open(img_path).convert('RGB')
-                orig_w, orig_h = img.size
-                _, box_raw = dataset.box_map[stem]
-
-                # Apply same transform as dataset
-                transform = dataset.transform
-                img_t     = transform(img)   # (3, 224, 224)
-
-                # Transform box correctly
-                box_transformed = transform_box_resize_centercrop(
-                    box_raw, orig_w, orig_h
-                )
-
-                # Denormalise for display
-                mean = np.array([0.485, 0.456, 0.406])
-                std  = np.array([0.229, 0.224, 0.225])
-                img_display = img_t.permute(1,2,0).numpy() * std + mean
-                img_display = np.clip(img_display, 0, 1)
-
-                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-                # Original with raw box
-                axes[0].imshow(img)
-                x1, y1, x2, y2 = box_raw
-                axes[0].add_patch(patches.Rectangle(
-                    (x1,y1), x2-x1, y2-y1,
-                    linewidth=2, edgecolor='red', facecolor='none'
-                ))
-                axes[0].set_title(f'Original {orig_w}×{orig_h}\nbox raw: {box_raw}')
-                axes[0].axis('off')
-
-                # Transformed with corrected box
-                axes[1].imshow(img_display)
-                x1, y1, x2, y2 = box_transformed
-                axes[1].add_patch(patches.Rectangle(
-                    (x1,y1), x2-x1, y2-y1,
-                    linewidth=2, edgecolor='red', facecolor='none'
-                ))
-                axes[1].set_title(f'Transformed 224×224\nbox transformed: {box_transformed}')
-                axes[1].axis('off')
-
-                plt.tight_layout()
-                plt.savefig('PAF-output/box_check_transformed.png', dpi=150, bbox_inches='tight')
-                plt.show()
-                '''
-
-                # Re-normalise after interpolation
-                '''
-                s = heatmap.sum()
-                if s > 0:
-                    heatmap = heatmap / s
-                '''
-
-                # Standard pointing game
                 pg_hit = pointing_game_single(heatmap, box)
                 hits[f'PAF_{mode_name}']  += int(pg_hit)
                 total[f'PAF_{mode_name}'] += 1
 
-                #heatmap_clean = preprocess_heatmap_for_evaluation(
-                #    heatmap,
-                #    clip_low  = 1.0,
-                #    clip_high = 99.0,
-                #    renorm    = True,
-                #)
-                # Mass-in-box metrics (PAF only)
                 metrics = paf_box_evaluation(heatmap, box, thresholds)
                 mass_scores[f'PAF_{mode_name}'].append(
                     metrics['mass_in_box']
@@ -720,68 +540,13 @@ def evaluate_pointing_game(
             # Baselines — standard pointing game only
             # --------------------------------------------------------
             if use_baselines:
-
-                # GradCAM++
-                try:
-                    cam = GradCAMPlusPlus(model=model,
-                                         target_layers=[target_layer])
-                    h   = cam(input_tensor=x)[0]
-                    h   = np.clip(h, 0, None)
-                    if h.max() > 0:
-                        h = h / h.max()
-                    hit = pointing_game_single(h, box)
-                    hits['GradCAM++']  += int(hit)
-                    total['GradCAM++'] += 1
-                except Exception as e:
-                    print(f"GradCAM++ failed: {e}")
-
-                # LRP
-                try:
-                    llrp = LayerLRP(model, target_layer)
-                    attr = llrp.attribute(x, target=label)
-                    h    = _to_numpy_hw(attr, H, W)
-                    hit  = pointing_game_single(h, box)
-                    hits['LRP']  += int(hit)
-                    total['LRP'] += 1
-                except Exception as e:
-                    print(f"LRP failed: {e}")
-
-                # DeepSHAP
-                try:
-                    shap_model  = _make_shap_safe(model)
-                    shap_layer  = _find_layer_in_copy(
-                        model, shap_model, target_layer
-                    )
-                    ldls     = LayerDeepLiftShap(shap_model, shap_layer)
-                    baseline = torch.zeros(
-                        5, *x.shape[1:], device=x.device
-                    )
-                    attr = ldls.attribute(
-                        x, baselines=baseline, target=label
-                    )
-                    h   = _to_numpy_hw(attr, H, W)
-                    hit = pointing_game_single(h, box)
-                    hits['DeepSHAP']  += int(hit)
-                    total['DeepSHAP'] += 1
-                except Exception as e:
-                    print(f"DeepSHAP failed: {e}")
-
-                # IG
-                try:
-                    lig  = LayerIntegratedGradients(model, target_layer)
-                    attr = lig.attribute(
-                        x,
-                        baselines          = torch.zeros_like(x),
-                        target             = label,
-                        n_steps            = 50,
-                        internal_batch_size= 1,
-                    )
-                    h   = _to_numpy_hw(attr, H, W)
-                    hit = pointing_game_single(h, box)
-                    hits['IG']  += int(hit)
-                    total['IG'] += 1
-                except Exception as e:
-                    print(f"IG failed: {e}")
+                baseline_results = baseline_runner.run(x, label, H, W)
+                for method_name, heatmap in baseline_results.items():
+                    if heatmap is None:
+                        continue
+                    hit = pointing_game_single(heatmap, box)
+                    hits[method_name] += int(hit)
+                    total[method_name] += 1
 
             n_processed += 1
 
@@ -798,12 +563,15 @@ def evaluate_pointing_game(
                     n           = n_processed,
                 )
 
+    # Final clean-up
+    paf_runner.cleanup()
+
     # Final results
     results = _aggregate_results(
         hits, total, mass_scores, th_hits, thresholds
     )
     _print_results(results, thresholds)
-    return results
+    return hits, total, mass_scores, th_hits
 
 
 # ============================================================================
@@ -916,205 +684,6 @@ def _print_results(results: Dict, thresholds: List[float]) -> None:
     print(f"  H50/H60/H70 = % images with MiB ≥ 50/60/70%")
     print(f"  N/A  = metric not applicable for gradient-based methods\n")
 
-'''
-def evaluate_pointing_game(
-    paf_class,                      # PAF class (not instance) for construction
-    model:        nn.Module,
-    hook_manager,                   # PAFHookManager instance
-    dataloader,                     # yields (images, labels, boxes)
-    device:       torch.device,
-    paf_modes:    List[tuple],      # list of (mode, kwargs) pairs
-    target_layer_name: str = 'layer4_1_conv2',  # for baselines
-    num_samples:  Optional[int] = None,
-    use_baselines: bool = True,
-) -> Dict[str, Dict]:
-    """
-    Run Pointing Game evaluation for PAF (all modes) and baseline methods.
-
-    Parameters
-    ----------
-    paf_class         : PAF class — used to construct PAF per image
-    model             : nn.Module in eval mode
-    hook_manager      : PAFHookManager — reused across images
-    dataloader        : yields (images, labels, boxes)
-                        boxes: (B, 4) tensor, pixel coords (x1,y1,x2,y2)
-    device            : torch device
-    paf_modes         : list of (ScoringMode, dict) pairs
-    target_layer_name : layer name for baseline layer-wise attribution
-    num_samples       : max images to evaluate (None = full dataset)
-    use_baselines     : whether to run GradCAM, LRP, DeepSHAP, IG
-
-    Returns
-    -------
-    results : {method_name: {'accuracy': float, 'hits': int, 'total': int}}
-    """
-    model.eval()
-
-    # Accumulate hits/totals per method
-    hits  = defaultdict(int)
-    total = defaultdict(int)
-
-    # Get baseline target layer module
-    module_map   = hook_manager.graph_info['module_map']
-    target_layer = module_map.get(target_layer_name)
-
-    if target_layer is None and use_baselines:
-        raise ValueError(
-            f"target_layer_name '{target_layer_name}' not found in module_map. "
-            f"Available: {list(module_map.keys())[:10]}"
-        )
-
-    # Find input layer (last in backward order = first layer of network)
-    input_layer = hook_manager.graph_info['backward_order'][-1]
-
-    n_processed = 0
-
-    for batch_idx, batch in enumerate(tqdm(dataloader,
-                                           desc='Pointing Game')):
-        if num_samples is not None and n_processed >= num_samples:
-            break
-
-        # Unpack batch — support (img, label, box) and (img, label, box, *extras)
-        images, labels, boxes = batch[0], batch[1], batch[2]
-        images = images.to(device)
-        labels = labels.to(device)
-
-        # boxes: (B, 4) as (x1, y1, x2, y2) in pixel coords
-        if isinstance(boxes, torch.Tensor):
-            boxes = boxes.cpu().numpy().astype(int)
-        B, C, H, W = images.shape
-
-        # ----------------------------------------------------------------
-        # PAF — one construction per image (PAF is per-sample)
-        # ----------------------------------------------------------------
-        for sample_idx in range(B):
-            if num_samples is not None and n_processed >= num_samples:
-                break
-
-            x      = images[sample_idx:sample_idx+1]   # (1,C,H,W)
-            label  = labels[sample_idx].item()
-            box    = tuple(boxes[sample_idx])           # (x1,y1,x2,y2)
-
-            # Run forward pass through hook manager
-            #hook_manager.run_forward(x)
-            #activations = hook_manager.activations
-            #weights     = _extract_weights(model)
-
-            try:
-                paf_instance = paf_class(
-                    model        = model,
-                    hook_manager = hook_manager,
-                    modes        = paf_modes,
-                    x            = x,
-                    target_class = label,
-                    true_class   = label,
-                )
-                distributions = paf_instance.distributions
-            except Exception as e:
-                print(f"PAF failed at sample {n_processed}: {e}")
-                n_processed += 1
-                continue
-
-            # Pointing game for each PAF mode
-            for mode_key in distributions:
-                mode_name = _mode_key_to_str(mode_key)
-                heatmap   = _paf_input_heatmap(
-                    distributions, mode_key, input_layer, H, W
-                )
-                hit = pointing_game_single(heatmap, box)
-                hits[f'PAF_{mode_name}']  += int(hit)
-                total[f'PAF_{mode_name}'] += 1
-
-            # ----------------------------------------------------------------
-            # Baselines
-            # ----------------------------------------------------------------
-            if use_baselines:
-
-                # GradCAM++
-                try:
-                    cam  = GradCAMPlusPlus(model=model,
-                                           target_layers=[target_layer])
-                    h    = cam(input_tensor=x)[0]   # (H,W) already upsampled
-                    h    = np.clip(h, 0, None)
-                    if h.max() > 0:
-                        h = h / h.max()
-                    hit  = pointing_game_single(h, box)
-                    hits['GradCAM++']  += int(hit)
-                    total['GradCAM++'] += 1
-                except Exception as e:
-                    print(f"GradCAM++ failed: {e}")
-
-                # LRP
-                try:
-                    llrp = LayerLRP(model, target_layer)
-                    attr = llrp.attribute(x, target=label)
-                    h    = _to_numpy_hw(attr, H, W)
-                    hit  = pointing_game_single(h, box)
-                    hits['LRP']  += int(hit)
-                    total['LRP'] += 1
-                except Exception as e:
-                    print(f"LRP failed: {e}")
-
-                # DeepSHAP
-                try:
-                    shap_model   = _make_shap_safe(model)
-                    shap_layer   = _find_layer_in_copy(
-                        model, shap_model, target_layer
-                    )
-                    ldls = LayerDeepLiftShap(shap_model, shap_layer)
-                    baseline = torch.zeros(5, *x.shape[1:], device=x.device)
-
-                    attr = ldls.attribute(
-                        x,
-                        baselines = baseline,
-                        target    = label,
-                    )
-                    h   = _to_numpy_hw(attr, H, W)
-                    hit = pointing_game_single(h, box)
-                    hits['DeepSHAP']  += int(hit)
-                    total['DeepSHAP'] += 1
-                except Exception as e:
-                    print(f"DeepSHAP failed: {e}")
-
-                # IG
-                try:
-                    lig  = LayerIntegratedGradients(model, target_layer)
-                    attr = lig.attribute(
-                        x,
-                        baselines          = torch.zeros_like(x),
-                        target             = label,
-                        n_steps            = 50,
-                        internal_batch_size= 1,
-                    )
-                    h   = _to_numpy_hw(attr, H, W)
-                    hit = pointing_game_single(h, box)
-                    hits['IG']  += int(hit)
-                    total['IG'] += 1
-                except Exception as e:
-                    print(f"IG failed: {e}")
-
-            n_processed += 1
-
-        # Progress log per batch
-        if (batch_idx + 1) % 10 == 0:
-            _print_current(hits, total, n_processed)
-
-    # ----------------------------------------------------------------
-    # Aggregate results
-    # ----------------------------------------------------------------
-    results = {}
-    for method in set(list(hits.keys()) + list(total.keys())):
-        h = hits.get(method, 0)
-        t = total.get(method, 0)
-        results[method] = {
-            'accuracy': h / t * 100 if t > 0 else 0.0,
-            'hits'    : h,
-            'total'   : t,
-        }
-
-    _print_results(results)
-    return results
-'''
 
 # ============================================================================
 # Helpers
@@ -1141,68 +710,4 @@ def _mode_key_to_str(mode_key: tuple) -> str:
         else:
             parts.append(str(part))
     return '_'.join(parts)
-
-
-def _make_shap_safe(model: nn.Module) -> nn.Module:
-    """Create a deepcopy with non-inplace ReLUs for DeepSHAP."""
-    import copy, types
-    try:
-        from torchvision.models.resnet import BasicBlock, Bottleneck
-    except ImportError:
-        return copy.deepcopy(model)
-
-    shap_model = copy.deepcopy(model)
-
-    def replace_relus(m):
-        for name, child in m.named_children():
-            if isinstance(child, nn.ReLU):
-                setattr(m, name, nn.ReLU(inplace=False))
-            else:
-                replace_relus(child)
-
-    replace_relus(shap_model)
-
-    def bb_fwd(self, x):
-        identity = x
-        out = self.relu1(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        if self.downsample is not None:
-            identity = self.downsample(x)
-        return self.relu2(out + identity)
-
-    def btn_fwd(self, x):
-        identity = x
-        out = self.relu1(self.bn1(self.conv1(x)))
-        out = self.relu2(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
-        if self.downsample is not None:
-            identity = self.downsample(x)
-        return self.relu3(out + identity)
-
-    for m in shap_model.modules():
-        if isinstance(m, BasicBlock):
-            m.relu1 = nn.ReLU(inplace=False)
-            m.relu2 = nn.ReLU(inplace=False)
-            m.forward = types.MethodType(bb_fwd, m)
-        elif isinstance(m, Bottleneck):
-            m.relu1 = nn.ReLU(inplace=False)
-            m.relu2 = nn.ReLU(inplace=False)
-            m.relu3 = nn.ReLU(inplace=False)
-            m.forward = types.MethodType(btn_fwd, m)
-
-    return shap_model
-
-
-def _find_layer_in_copy(
-    original: nn.Module,
-    copy:     nn.Module,
-    target:   nn.Module,
-) -> nn.Module:
-    """Find the equivalent of target layer in a deepcopy of the model."""
-    for name, mod in original.named_modules():
-        if mod is target:
-            return dict(copy.named_modules())[name]
-    raise ValueError("target layer not found in original model")
-
-
 

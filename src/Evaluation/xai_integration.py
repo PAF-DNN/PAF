@@ -10,7 +10,7 @@ from captum.attr import IntegratedGradients, LRP, DeepLiftShap
 from pytorch_grad_cam import GradCAMPlusPlus
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
-from core.nn_graph import make_model_universal_for_shap
+from core.compat.shap import make_model_universal_for_shap
 
 class XAI:
     def __init__(self, model):
